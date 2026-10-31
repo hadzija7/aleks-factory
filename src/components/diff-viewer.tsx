@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { DiffFile } from "@/lib/projects";
+import type { DiffFile, LocalEnvFile } from "@/lib/projects";
 import type { Task } from "@/lib/tasks";
 
 const LARGE_FILE_LINES = 400;
@@ -18,6 +18,7 @@ const fileId = (path: string) => `diff-${path.replace(/[^a-zA-Z0-9]/g, "-")}`;
 /** Full-screen review of a task branch's changes, with commit & merge into main. */
 export function DiffViewer({ task, onClose, onCommitted }: { task: Task; onClose: () => void; onCommitted: () => void }) {
   const [files, setFiles] = useState<DiffFile[] | null>(null);
+  const [envFiles, setEnvFiles] = useState<LocalEnvFile[]>([]);
   const [message, setMessage] = useState(task.title);
   const [committing, setCommitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -25,7 +26,10 @@ export function DiffViewer({ task, onClose, onCommitted }: { task: Task; onClose
   useEffect(() => {
     fetch(`/api/tasks/${task.id}/diff`, { cache: "no-store" })
       .then((res) => (res.ok ? res.json() : Promise.reject(new Error(res.statusText))))
-      .then((data: { files: DiffFile[] }) => setFiles(data.files))
+      .then((data: { files: DiffFile[]; envFiles: LocalEnvFile[] }) => {
+        setFiles(data.files);
+        setEnvFiles(data.envFiles);
+      })
       .catch((e: Error) => setError(`Failed to load diff: ${e.message}`));
   }, [task.id]);
 
@@ -83,6 +87,7 @@ export function DiffViewer({ task, onClose, onCommitted }: { task: Task; onClose
 
           <main className="min-w-0 flex-1 space-y-4 overflow-y-auto p-4">
             {!files && !error && <p className="text-sm opacity-60">Loading diff…</p>}
+            {envFiles.length > 0 && <EnvFilesNote envFiles={envFiles} />}
             {files?.length === 0 && <p className="text-sm opacity-60">No changes on this branch yet.</p>}
             {files?.map((f) => <FileDiff key={f.path} file={f} />)}
           </main>
@@ -104,6 +109,26 @@ export function DiffViewer({ task, onClose, onCommitted }: { task: Task; onClose
         </footer>
       </div>
     </div>
+  );
+}
+
+/** Gitignored env files aren't part of the diff; show which keys exist (never values) and that they carry over to main. */
+function EnvFilesNote({ envFiles }: { envFiles: LocalEnvFile[] }) {
+  return (
+    <section className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs">
+      <p className="font-medium">Local environment (not committed, copied to main on merge)</p>
+      {envFiles.map((f) => (
+        <p key={f.path} className="mt-1 flex flex-wrap items-center gap-1.5">
+          <code className="opacity-70">{f.path}</code>
+          {f.keys.length === 0 && <span className="opacity-50">no keys</span>}
+          {f.keys.map((key) => (
+            <code key={key} className="rounded bg-black/5 px-1.5 py-0.5 dark:bg-white/10">
+              {key}
+            </code>
+          ))}
+        </p>
+      ))}
+    </section>
   );
 }
 

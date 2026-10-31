@@ -1,9 +1,9 @@
 import { existsSync } from "node:fs";
-import { mkdir, rm } from "node:fs/promises";
+import { lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { parseDiff } from "./diff";
 import { DATA_DIR, errorMessage, execFileAsync, nodeModulesVolume, removeVolume, runSetupCommand } from "./docker";
-import type { DiffFile, Project } from "./projects";
+import type { DiffFile, LocalEnvFile, Project } from "./projects";
 import type { Task } from "./tasks";
 
 const CREATE_NEXT_APP = "create-next-app@16.4.2";
@@ -55,6 +55,56 @@ export async function bootstrapProject(project: Project) {
   await git(dir, ["commit", "-m", "Bootstrap Next.js app"]);
 }
 
+const ENV_LINE = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/;
+
+const isRegularFile = (file: string) => lstat(file).then((stat) => stat.isFile(), () => false);
+
+/**
+ * Gitignored env files at the checkout root (.env, .env.local, …). They hold secrets, so the board syncs them between
+ * main and task worktrees itself instead of committing them. Symlinks are skipped so an agent can't pull in host files.
+ */
+async function localEnvFiles(dir: string, runGit: (args: string[]) => Promise<string>) {
+  const listed = await runGit(["ls-files", "--others", "--ignored", "--exclude-standard", "--", ".env*"]);
+  const names = listed.split("\n").filter((name) => name && !name.includes("/"));
+  const regular = await Promise.all(names.map((name) => isRegularFile(path.join(dir, name))));
+  return names.filter((_, i) => regular[i]);
+}
+
+/** Copies env files from one checkout to another; for files that already exist, keys from `fromDir` win and other keys are kept. */
+async function syncEnvFiles(fromDir: string, names: string[], toDir: string) {
+  for (const name of names) {
+    const source = await readFile(path.join(fromDir, name), "utf8");
+    const target = path.join(toDir, name);
+    if (!(await isRegularFile(target))) {
+      await rm(target, { force: true });
+      await writeFile(target, source);
+      continue;
+    }
+    const lines = (await readFile(target, "utf8")).split("\n");
+    for (const line of source.split("\n")) {
+      const key = line.match(ENV_LINE)?.[1];
+      if (!key) continue;
+      const index = lines.findIndex((l) => l.match(ENV_LINE)?.[1] === key);
+      if (index === -1) lines.splice(lines.at(-1) === "" ? lines.length - 1 : lines.length, 0, line);
+      else lines[index] = line;
+    }
+    await writeFile(target, lines.join("\n"));
+  }
+}
+
+/** Env files in a task's worktree with their key names (never values), for the review screen. */
+export async function taskEnvFiles(task: Task): Promise<LocalEnvFile[]> {
+  if (!hasWorktree(task)) return [];
+  const dir = worktreeDir(task);
+  const names = await localEnvFiles(dir, (args) => worktreeGit(task, args));
+  return Promise.all(
+    names.map(async (name) => ({
+      path: name,
+      keys: (await readFile(path.join(dir, name), "utf8")).split("\n").flatMap((line) => line.match(ENV_LINE)?.[1] ?? []),
+    })),
+  );
+}
+
 /** Creates the task's branch and worktree off main (once) and installs dependencies so the offline agent sandbox can build. */
 export async function ensureWorktree(task: Task) {
   const dir = worktreeDir(task);
@@ -66,6 +116,7 @@ export async function ensureWorktree(task: Task) {
   const branchExists = await git(repo, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).then(() => true, () => false);
   await git(repo, branchExists ? ["worktree", "add", dir, branch] : ["worktree", "add", "-b", branch, dir, "main"]);
   if (!existsSync(worktreeGitDir(task))) throw new Error(`Unexpected worktree admin dir for ${branch}`);
+  await syncEnvFiles(repo, await localEnvFiles(repo, (args) => git(repo, args)), dir);
   if (existsSync(path.join(dir, "package-lock.json"))) {
     const install = await runSetupCommand(dir, "npm ci --no-audit --no-fund", taskKey(task));
     if (!install.ok) throw new Error(`npm ci failed:\n${install.output}`);
@@ -101,6 +152,8 @@ export async function commitAndMergeTask(task: Task, message: string) {
     throw new Error(`Merging ${branch} into main failed, likely a conflict with work merged since:\n${errorMessage(error)}`);
   }
   const sha = (await git(repo, ["rev-parse", "--short", branch])).trim();
+  // Env files are gitignored, so carry the task's secrets over to main before its worktree is deleted.
+  await syncEnvFiles(worktreeDir(task), await localEnvFiles(worktreeDir(task), (args) => worktreeGit(task, args)), repo);
   await removeWorktree(task);
   return sha;
 }

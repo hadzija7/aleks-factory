@@ -35,3 +35,6 @@ export type DiffFile = {
   binary: boolean;
   hunks: DiffHunk[];
 };
+
+/** A gitignored env file in a checkout; only key names ever leave the server. */
+export type LocalEnvFile = { path: string; keys: string[] };
