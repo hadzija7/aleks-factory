@@ -8,9 +8,10 @@
     "start": "next start",
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run src"
   },
   "dependencies": {
+    "@mozaik-ai/cloud-sdk": "0.1.3",
     "@mozaik-ai/core": "4.1.0",
     "next": "16.4.2",
     "react": "19.3.0",

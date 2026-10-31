@@ -41,5 +41,5 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# task storage
+# local app data: projects (git repos + worktrees), tasks, activity logs, docker helpers
 /data

@@ -45,6 +45,7 @@ export function createCodingTools(workspace: string, sandbox: Pick<DockerSandbox
   async function resolvePath(p: string) {
     const target = path.resolve(root, p);
     if (!isInside(root, target)) throw new Error(`Path "${p}" is outside the project folder`);
+    if (path.relative(root, target).split(path.sep)[0] === ".git") throw new Error("The .git metadata is managed by the board and cannot be accessed");
     let existing = target;
     while (!(await exists(existing))) existing = path.dirname(existing);
     if (!isInside(root, await realpath(existing))) throw new Error(`Path "${p}" resolves outside the project folder`);

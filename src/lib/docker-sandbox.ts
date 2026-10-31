@@ -1,65 +1,17 @@
-import { execFile, execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdirSync, realpathSync } from "node:fs";
-import { promisify } from "node:util";
+import { DEFAULT_SANDBOX_IMAGE, claimContainer, containerLabels, errorMessage, execFileAsync, hostUserArgs, nodeModulesVolume, removeContainer } from "./docker";
 
-const execFileAsync = promisify(execFile);
+export { DEFAULT_SANDBOX_IMAGE } from "./docker";
 
-const LABEL = "aleks-factory.sandbox=1";
 const COMMAND_TIMEOUT_S = 60;
 // Host-side guard in case `docker exec` itself hangs past the in-container timeout.
 const HOST_TIMEOUT_MS = (COMMAND_TIMEOUT_S + 15) * 1000;
 const OUTPUT_CAP_BYTES = 8 * 1024;
 
-export const DEFAULT_SANDBOX_IMAGE = process.env.AGENT_SANDBOX_IMAGE ?? "node:22-bookworm";
-
 export type CommandResult = { ok: boolean; exitCode: number | null; timedOut: boolean; stdout: string; stderr: string };
 
 const errorResult = (message: string): CommandResult => ({ ok: false, exitCode: null, timedOut: false, stdout: "", stderr: message });
-
-const errorMessage = (error: unknown) => {
-  const e = error as { stderr?: string; message?: string };
-  return (e.stderr?.trim() || e.message || String(error)).slice(-OUTPUT_CAP_BYTES);
-};
-
-// Process-wide state lives on globalThis so dev hot reloads don't treat this process's containers as stale.
-const registry = ((globalThis as { __agentSandboxes?: { active: Set<string>; cleanupInstalled: boolean; staleCleanup?: Promise<void> } })
-  .__agentSandboxes ??= { active: new Set(), cleanupInstalled: false });
-const active = registry.active;
-
-function removeActiveSync() {
-  if (active.size === 0) return;
-  try {
-    execFileSync("docker", ["rm", "-f", ...active], { stdio: "ignore", timeout: 15_000 });
-  } catch {}
-  active.clear();
-}
-
-function installProcessCleanup() {
-  if (registry.cleanupInstalled) return;
-  registry.cleanupInstalled = true;
-  // "exit" also fires when Node dies from an uncaught exception, so it covers crashes.
-  process.on("exit", removeActiveSync);
-  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
-    process.once(signal, () => {
-      removeActiveSync();
-      // Only force the exit if nobody else (e.g. Next.js) is handling the signal.
-      if (process.listenerCount(signal) === 0) process.kill(process.pid, signal);
-    });
-  }
-}
-
-/** Removes agent sandboxes left behind by previous processes. Runs once per process, before the first container starts. */
-export function removeStaleSandboxes() {
-  return (registry.staleCleanup ??= (async () => {
-    try {
-      const { stdout } = await execFileAsync("docker", ["ps", "-aq", "--filter", `label=${LABEL}`, "--filter", "name=^agent-"]);
-      const ids = stdout.split("\n").filter(Boolean);
-      if (ids.length) await execFileAsync("docker", ["rm", "-f", ...ids]);
-    } catch (error) {
-      console.error("[sandbox] failed to remove stale containers:", errorMessage(error));
-    }
-  })());
-}
 
 /** Appends to a buffer while keeping only its last `OUTPUT_CAP_BYTES`. */
 const appendTail = (buffer: Buffer, chunk: Buffer) => {
@@ -76,6 +28,8 @@ export class DockerSandbox {
   constructor(
     sessionId: string,
     projectRoot: string,
+    /** Docker volume key holding this checkout's node_modules (installed by the networked setup step). */
+    private readonly nodeModulesKey?: string,
     private readonly image = DEFAULT_SANDBOX_IMAGE,
   ) {
     this.name = `agent-${sessionId.replace(/[^a-zA-Z0-9_.-]/g, "-")}`;
@@ -92,18 +46,13 @@ export class DockerSandbox {
   }
 
   private async createContainer() {
-    installProcessCleanup();
-    await removeStaleSandboxes();
-    await execFileAsync("docker", ["rm", "-f", this.name]).catch(() => {});
-    const uid = process.getuid?.() ?? 1000;
-    const gid = process.getgid?.() ?? 1000;
-    // Track before `run` so a crash mid-start still cleans the container up.
-    active.add(this.name);
+    // Claim before `run` so a crash mid-start still cleans the container up.
+    await claimContainer(this.name);
     await execFileAsync("docker", [
-      "run", "-d", "--name", this.name, "--label", LABEL,
+      "run", "-d", "--name", this.name, ...containerLabels(),
       "--network", "none",
-      "-v", `${this.projectRoot}:/work`, "-w", "/work",
-      "--user", `${uid}:${gid}`, "-e", "HOME=/tmp",
+      "-v", `${this.projectRoot}:/work`, "-w", "/work", ...hostUserArgs(),
+      ...(this.nodeModulesKey ? ["-v", `${nodeModulesVolume(this.nodeModulesKey)}:/work/node_modules`] : []),
       "--memory", "1g", "--cpus", "1", "--pids-limit", "256",
       this.image, "sleep", "infinity",
     ]);
@@ -166,9 +115,6 @@ export class DockerSandbox {
 
   async dispose() {
     this.starting = undefined;
-    active.delete(this.name);
-    await execFileAsync("docker", ["rm", "-f", this.name]).catch((error) =>
-      console.error(`[sandbox] failed to remove ${this.name}:`, errorMessage(error)),
-    );
+    await removeContainer(this.name);
   }
 }
