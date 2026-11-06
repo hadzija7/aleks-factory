@@ -21,6 +21,9 @@ import type { ActivityRole } from "./activity";
 import { addActivity, updateActivity } from "./activity-log";
 import { createCodingTools } from "./coding-tools";
 import { DockerSandbox } from "./docker-sandbox";
+import { closeEgress, openEgress } from "./egress";
+import { getProject } from "./project-store";
+import { DEFAULT_ALLOWED_DOMAINS } from "./projects";
 import { updateTask } from "./task-store";
 import type { Task } from "./tasks";
 import { ensureWorktree, hasWorktree, taskKey } from "./workspace";
@@ -33,25 +36,32 @@ const EXECUTOR_INSTRUCTION = `You are an autonomous coding agent.
 You receive a task from a kanban board and must complete it inside a single project folder (a git checkout of the task's branch).
 Use list_files and read_file to understand the project, edit_file for targeted changes, write_file for new files,
 and run_command to run tests or the build so you can verify your own work. All paths are relative to the project root.
-run_command runs in an offline Linux container where the project root is /work, so dependencies cannot be downloaded.
-Dependencies are already installed; node_modules lives inside the container, so inspect it with run_command rather than read_file. Without network, \`next build\` can fail fetching Google Fonts; prefer lint and \`npx tsc --noEmit\` to verify.
+run_command runs in a Linux container where the project root is /work. Its internet access is limited to the domains listed in the task
+(HTTP/HTTPS through a proxy that curl, npm and Node's fetch pick up automatically); everything else is blocked.
+Dependencies are already installed (\`npm install <pkg>\` works while the npm registry is allowed); node_modules lives inside the container,
+so inspect it with run_command rather than read_file. \`next build\` can fail fetching Google Fonts unless fonts.googleapis.com is allowed;
+lint and \`npx tsc --noEmit\` always work.
 Do not run git commands: the board commits and merges your work after a human reviews it.
 Secrets: when the task gives you API keys, tokens or other credentials, write them to \`.env.local\` at the project root
 (create or update it with write_file/edit_file, one NAME=value per line) and read them via \`process.env.NAME\` in server-side code only.
 Never hardcode secrets in source files, expose them to the browser (no NEXT_PUBLIC_ prefix, no client components), or print them in commands.
 \`.env.local\` is gitignored on purpose; the board keeps it with the project. If you add a new variable, also list its name (no value) in \`.env.example\`.
-External APIs: the sandbox has no network, so never guess endpoints or response formats. Use only what the task or existing code states,
-and clearly list any unverified assumptions in your final summary.
+External APIs: before integrating one, read its documentation with curl (strip HTML to keep output small, e.g.
+\`curl -sL URL | sed -e 's/<[^>]*>//g' | grep -v '^[[:space:]]*$' | head -200\`) and test the real endpoint with keys loaded from .env.local
+(\`set -a; . ./.env.local; set +a; curl -s -H "Authorization: Bearer $NAME" URL | head -c 2000\`). Never guess endpoints or response formats,
+and never send a secret to any host other than the API it belongs to. If a domain is blocked or something couldn't be verified, say so in your final summary.
 If a tool returns an error, read it, fix the cause and try again.
 If the task includes code review findings, address every one of them.
 When finished, respond with the final result in concise markdown: what you changed and how you verified it.`;
 
 const REVIEWER_INSTRUCTION = `You are a senior code reviewer.
 You review the changes another agent made in a project folder to complete a kanban task.
-Use list_files and read_file to inspect the code, and run_command to run tests, lint or the build (offline Linux container, project root is /work).
+Use list_files and read_file to inspect the code, and run_command to run tests, lint or the build (Linux container, project root is /work,
+internet limited to the allowed domains listed in the task).
 Do not modify any files. Check that the task is fully implemented, correct, tested where reasonable, and free of obvious bugs or security issues.
 Secrets must come from \`.env.local\` via process.env on the server: request changes if a secret is hardcoded, exposed to the client, or the code needs a variable missing from \`.env.local\`.
-Integrations with external APIs can't be tested offline: verify the endpoint and response format are taken from the task or existing code rather than guessed, and state any unverified assumptions in your summary.
+For external API integrations, check the endpoint, auth and response format against the API's docs or a real curl call (when its domain is allowed);
+request changes if they were guessed or don't match, and state anything you couldn't verify in your summary.
 Approve when the work is ready to ship; only request changes for real problems, not style nitpicks.
 Each finding must be specific and actionable (file, problem, expected fix).`;
 
@@ -125,6 +135,11 @@ const inferenceRunner: InferenceRunner = {
  * Prepares the task's git worktree (its workspace) and one sandbox container per task session, shared by the executor
  * and the reviewer until the task is done or failed. Marks the task failed and returns undefined if setup fails.
  */
+const networkNote = (domains?: string[]) =>
+  domains
+    ? `\n\n## Network\nrun_command can reach only these domains over HTTP(S): ${domains.join(", ")}. Other hosts get a 403 from the egress proxy; if you need one, name it in your summary so the user can allow it.`
+    : "\n\n## Network\nrun_command has no network access in this session.";
+
 async function sessionFor(task: Task) {
   const { state } = resolveRuntime();
   const setup = hasWorktree(task) ? undefined : addActivity(task.id, { kind: "setup", title: "Creating branch and installing dependencies", status: "running" });
@@ -132,14 +147,17 @@ async function sessionFor(task: Task) {
     const { dir, branch } = await ensureWorktree(task);
     if (setup) updateActivity(task.id, setup, { status: "done", title: `Workspace ready on ${branch}` });
     if (task.branch !== branch) await updateTask(task.id, { branch });
+    // Refreshes the allowlist on every phase, so domains added mid-task apply to the running sandbox. Falls back to offline.
+    const allowed = (await getProject(task.projectId))?.allowedDomains ?? [];
+    const networkArgs = await openEgress(task.id, allowed).catch((e) => console.error(`[agent] egress proxy unavailable for task ${task.id}`, e));
     let sandbox = state.sandboxByTask.get(task.id);
     if (!sandbox) {
-      sandbox = new DockerSandbox(task.id, dir, taskKey(task));
+      sandbox = new DockerSandbox(task.id, dir, { nodeModulesKey: taskKey(task), networkArgs: networkArgs ?? undefined });
       state.sandboxByTask.set(task.id, sandbox);
     }
     // run_command retries the start if it fails here.
     await sandbox.start().catch((e) => console.error(`[agent] failed to start sandbox for task ${task.id}`, e));
-    return { dir, sandbox };
+    return { dir, sandbox, domains: networkArgs ? [...new Set([...DEFAULT_ALLOWED_DOMAINS, ...allowed])] : undefined };
   } catch (error) {
     const message = `Workspace setup failed: ${error instanceof Error ? error.message : String(error)}`;
     if (setup) updateActivity(task.id, setup, { status: "error", detail: message });
@@ -152,6 +170,7 @@ function endSession(taskId: string) {
   const { state } = resolveRuntime();
   void state.sandboxByTask.get(taskId)?.dispose();
   state.sandboxByTask.delete(taskId);
+  void closeEgress(taskId);
 }
 
 function startLoop(agent: Agent, taskId: string, role: Role, message: string, input: Omit<InferenceInput, "model" | "context">) {
@@ -186,7 +205,7 @@ const executeAssignedTask: SituationHandler = {
       const rework = task.review
         ? `\n\n## Code review findings to fix (round ${task.reviewRounds ?? 1})\n\n${task.review}\n\n## Your previous summary\n\n${task.result ?? ""}`
         : "";
-      startLoop(agent, task.id, "execute", taskBrief(task) + rework, {
+      startLoop(agent, task.id, "execute", taskBrief(task) + networkNote(session.domains) + rework, {
         tools: [...agent.getTools(), ...createCodingTools(session.dir, session.sandbox)],
       });
     },
@@ -203,7 +222,7 @@ const reviewImplementedTask: SituationHandler = {
       const session = await sessionFor(task);
       if (!session) return;
       const summary = task.result ? `\n\n## Implementer's summary\n\n${task.result}` : "";
-      startLoop(agent, task.id, "review", `Review the implementation of this task.\n\n${taskBrief(task)}${summary}`, {
+      startLoop(agent, task.id, "review", `Review the implementation of this task.\n\n${taskBrief(task)}${networkNote(session.domains)}${summary}`, {
         tools: [...agent.getTools(), ...createCodingTools(session.dir, session.sandbox).filter((tool) => REVIEW_TOOLS.has(tool.name))],
         structuredOutput: REVIEW_FORMAT,
       });

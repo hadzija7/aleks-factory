@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { PROJECT_TEMPLATES, type Project } from "@/lib/projects";
 import { KanbanBoard } from "./kanban-board";
+import { NetworkAccess } from "./network-access";
 import { PreviewControl } from "./preview-control";
 import { ProjectStatusBadge } from "./project-status-badge";
 
@@ -72,7 +73,12 @@ export function ProjectView({ projectId }: { projectId: string }) {
           {project.error && <pre className="mt-2 max-h-80 overflow-auto whitespace-pre-wrap text-xs">{project.error}</pre>}
         </div>
       )}
-      {project.status === "ready" && <KanbanBoard projectId={project.id} />}
+      {project.status === "ready" && (
+        <>
+          <NetworkAccess project={project} onChange={setProject} />
+          <KanbanBoard projectId={project.id} />
+        </>
+      )}
     </div>
   );
 }

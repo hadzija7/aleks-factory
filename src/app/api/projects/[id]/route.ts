@@ -1,7 +1,8 @@
 import { connection } from "next/server";
 import { clearActivity } from "@/lib/activity-log";
 import { mainPreviewTarget, stopPreview, taskPreviewTarget } from "@/lib/preview";
-import { deleteProject, getProject } from "@/lib/project-store";
+import { deleteProject, getProject, updateProject } from "@/lib/project-store";
+import { normalizeDomain } from "@/lib/projects";
 import { deleteProjectTasks, listTasks } from "@/lib/task-store";
 import { isAgentBusy } from "@/lib/tasks";
 import { removeProjectFiles } from "@/lib/workspace";
@@ -9,6 +10,18 @@ import { removeProjectFiles } from "@/lib/workspace";
 export async function GET(_request: Request, ctx: RouteContext<"/api/projects/[id]">) {
   await connection();
   const project = await getProject((await ctx.params).id);
+  return project ? Response.json(project) : Response.json({ error: "not found" }, { status: 404 });
+}
+
+/** Updates the domains agent sandboxes may reach. Running tasks pick the change up at their next phase. */
+export async function PATCH(request: Request, ctx: RouteContext<"/api/projects/[id]">) {
+  const { id } = await ctx.params;
+  const { allowedDomains } = await request.json();
+  if (!Array.isArray(allowedDomains)) return Response.json({ error: "allowedDomains must be an array" }, { status: 400 });
+  const domains = allowedDomains.map((d) => (typeof d === "string" ? normalizeDomain(d) : undefined));
+  const invalid = allowedDomains.filter((_, i) => !domains[i]);
+  if (invalid.length) return Response.json({ error: `invalid domain: ${invalid.join(", ")}` }, { status: 400 });
+  const project = await updateProject(id, { allowedDomains: [...new Set(domains as string[])] });
   return project ? Response.json(project) : Response.json({ error: "not found" }, { status: 404 });
 }
 
