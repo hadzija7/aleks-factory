@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { mkdirSync, realpathSync } from "node:fs";
-import { DEFAULT_SANDBOX_IMAGE, claimContainer, containerLabels, errorMessage, execFileAsync, hostUserArgs, nodeModulesVolume, removeContainer } from "./docker";
+import { DEFAULT_SANDBOX_IMAGE, claimContainer, containerLabels, dependencyArgs, errorMessage, execFileAsync, hostUserArgs, removeContainer } from "./docker";
 
 export { DEFAULT_SANDBOX_IMAGE } from "./docker";
 
@@ -28,9 +28,13 @@ export class DockerSandbox {
   constructor(
     sessionId: string,
     projectRoot: string,
-    /** Docker volume key holding this checkout's node_modules (installed by the networked setup step). */
-    private readonly nodeModulesKey?: string,
-    private readonly image = DEFAULT_SANDBOX_IMAGE,
+    private readonly options: {
+      /** Docker volume key holding this checkout's node_modules. */
+      nodeModulesKey?: string;
+      /** `docker run` args putting the sandbox behind the egress proxy; without them it has no network at all. */
+      networkArgs?: string[];
+      image?: string;
+    } = {},
   ) {
     this.name = `agent-${sessionId.replace(/[^a-zA-Z0-9_.-]/g, "-")}`;
     mkdirSync(projectRoot, { recursive: true });
@@ -50,11 +54,11 @@ export class DockerSandbox {
     await claimContainer(this.name);
     await execFileAsync("docker", [
       "run", "-d", "--name", this.name, ...containerLabels(),
-      "--network", "none",
+      ...(this.options.networkArgs ?? ["--network", "none"]),
       "-v", `${this.projectRoot}:/work`, "-w", "/work", ...hostUserArgs(),
-      ...(this.nodeModulesKey ? ["-v", `${nodeModulesVolume(this.nodeModulesKey)}:/work/node_modules`] : []),
+      ...(this.options.nodeModulesKey ? await dependencyArgs(this.options.nodeModulesKey) : []),
       "--memory", "1g", "--cpus", "1", "--pids-limit", "256",
-      this.image, "sleep", "infinity",
+      this.options.image ?? DEFAULT_SANDBOX_IMAGE, "sleep", "infinity",
     ]);
   }
 

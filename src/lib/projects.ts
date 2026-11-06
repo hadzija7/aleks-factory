@@ -11,10 +11,23 @@ export type Project = {
   name: string;
   template: ProjectTemplate;
   status: ProjectStatus;
+  /** Extra domains agent sandboxes may reach through the egress proxy (e.g. "api.example.com", "*.example.com"). */
+  allowedDomains?: string[];
   error?: string;
   createdAt: string;
   updatedAt: string;
 };
+
+/** Always reachable from agent sandboxes so they can install packages; projects add their own domains on top. */
+export const DEFAULT_ALLOWED_DOMAINS = ["registry.npmjs.org"];
+
+const DOMAIN = /^(\*\.)?([a-z0-9-]+\.)+[a-z]{2,}$/;
+
+/** Normalizes input like "https://api.example.com/path" to "api.example.com"; returns undefined if it isn't a domain. */
+export function normalizeDomain(input: string) {
+  const host = input.trim().toLowerCase().replace(/^[a-z]+:\/\//, "").split(/[/:?#]/)[0];
+  return DOMAIN.test(host) ? host : undefined;
+}
 
 export const isProjectTemplate = (value: unknown): value is ProjectTemplate => PROJECT_TEMPLATES.some((t) => t.id === value);
 

@@ -65,3 +65,45 @@ describe.skipIf(!dockerAvailable)("run_command docker sandbox", { timeout: 120_0
     expect(await run("echo still-here")).toMatchObject({ ok: true, stdout: "still-here\n" });
   });
 });
+
+describe.skipIf(!dockerAvailable)("run_command egress proxy", { timeout: 180_000 }, () => {
+  let base: string;
+  let sandbox: DockerSandbox;
+  let run: (command: string) => Promise<CommandResult>;
+  const session = `egress-test-${process.pid}`;
+
+  beforeAll(async () => {
+    const { openEgress } = await import("./egress");
+    base = mkdtempSync(path.join(os.tmpdir(), "egress-test-"));
+    sandbox = new DockerSandbox(session, base, { networkArgs: await openEgress(session, ["example.com"]) });
+    run = (command) => sandbox.exec(command);
+    await sandbox.start();
+  });
+
+  afterAll(async () => {
+    const { closeEgress } = await import("./egress");
+    await sandbox?.dispose();
+    await closeEgress(session);
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  it("reaches allowed domains through the proxy", async () => {
+    const result = await run("curl -sS -o /dev/null -w '%{http_code}' --max-time 20 https://example.com");
+    expect(result).toMatchObject({ ok: true, stdout: "200" });
+  });
+
+  it("blocks domains that are not allowed", async () => {
+    const result = await run("curl -sS --max-time 20 https://github.com");
+    expect(result.ok).toBe(false);
+    expect(result.stderr + result.stdout).toMatch(/403/);
+  });
+
+  it("has no route to the internet that bypasses the proxy", async () => {
+    const result = await run("curl -sS --noproxy '*' --max-time 10 https://example.com");
+    expect(result.ok).toBe(false);
+  });
+
+  it("lets npm use the always-allowed registry", async () => {
+    expect(await run("npm view is-number version")).toMatchObject({ ok: true });
+  });
+});
