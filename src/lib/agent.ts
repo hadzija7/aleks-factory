@@ -26,9 +26,11 @@ import { getProject } from "./project-store";
 import { DEFAULT_ALLOWED_DOMAINS } from "./projects";
 import { updateTask } from "./task-store";
 import type { Task } from "./tasks";
-import { ensureWorktree, hasWorktree, taskKey } from "./workspace";
+import { AgentRun, type AgentName } from "./tracing";
+import { ensureWorktree, hasWorktree, taskKey, taskVcs } from "./workspace";
 
 const MODEL = process.env.MOZAIK_MODEL ?? "gpt-5.5";
+const PROVIDER = supportedModels.find((m) => m.specification.name === MODEL)?.specification.provider;
 const MAX_REVIEW_ROUNDS = Number(process.env.MAX_REVIEW_ROUNDS ?? 3);
 const REVIEW_TOOLS = new Set(["list_files", "read_file", "run_command"]);
 
@@ -81,7 +83,7 @@ const REVIEW_FORMAT: StructuredOutputFormat = {
 };
 
 type Role = ActivityRole;
-type Session = { taskId: string; role: Role; contextId: string };
+type Session = { taskId: string; role: Role; contextId: string; run: AgentRun };
 type Review = { verdict: "approve" | "request_changes"; summary: string; findings: string[] };
 
 type TaskAssignedPayload = { task: Task };
@@ -115,14 +117,14 @@ class WhenEvent extends SituationSpecification {
 // Inference errors are not surfaced as events by runLoop, so we turn them into a final answer and record the failure.
 const inferenceRunner: InferenceRunner = {
   async run(input) {
+    const session = resolveRuntime().state.sessionByContext.get(input.context.id);
     try {
       const model = supportedModels.find((m) => m.specification.name === input.model);
       if (!model) throw new Error(`Unsupported model: ${input.model}`);
-      return await model.endpoint.infer(input);
+      return await (session ? session.run.modelTurn(() => model.endpoint.infer(input)) : model.endpoint.infer(input));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const taskId = resolveRuntime().state.sessionByContext.get(input.context.id)?.taskId;
-      if (taskId) resolveRuntime().state.failures.set(taskId, message);
+      if (session) resolveRuntime().state.failures.set(session.taskId, message);
       return { items: [ModelMessageItem.rehydrate({ text: message })], tokenUsage: undefined, rowResponse: null };
     }
   },
@@ -173,9 +175,22 @@ function endSession(taskId: string) {
   void closeEgress(taskId);
 }
 
-function startLoop(agent: Agent, taskId: string, role: Role, message: string, input: Omit<InferenceInput, "model" | "context">) {
+const AGENT_NAMES: Record<Role, AgentName> = { execute: "implement", review: "review" };
+
+/** One traced session per agent run; run_command's sandbox calls become `docker_exec` tool spans. */
+async function startRun(task: Task, role: Role, sandbox: DockerSandbox) {
+  const run = await AgentRun.start({ agentName: AGENT_NAMES[role], model: MODEL, provider: PROVIDER, vcs: await taskVcs(task) });
+  const traced: Pick<DockerSandbox, "exec"> = {
+    exec: (command) =>
+      run.executeTool("docker_exec", () => sandbox.exec(command), (r) =>
+        r.ok ? undefined : r.timedOut ? "Command timed out" : `Command failed with exit code ${r.exitCode ?? "unknown"}`),
+  };
+  return { run, sandbox: traced };
+}
+
+function startLoop(agent: Agent, taskId: string, role: Role, run: AgentRun, message: string, input: Omit<InferenceInput, "model" | "context">) {
   const context = ModelContext.create().addContextItem(DeveloperMessageItem.create(agent.getDeveloperMessage()));
-  resolveRuntime().state.sessionByContext.set(context.id, { taskId, role, contextId: context.id });
+  resolveRuntime().state.sessionByContext.set(context.id, { taskId, role, contextId: context.id, run });
   runLoop(agent.getId(), message, { model: MODEL, context, ...input });
 }
 
@@ -205,8 +220,9 @@ const executeAssignedTask: SituationHandler = {
       const rework = task.review
         ? `\n\n## Code review findings to fix (round ${task.reviewRounds ?? 1})\n\n${task.review}\n\n## Your previous summary\n\n${task.result ?? ""}`
         : "";
-      startLoop(agent, task.id, "execute", taskBrief(task) + networkNote(session.domains) + rework, {
-        tools: [...agent.getTools(), ...createCodingTools(session.dir, session.sandbox)],
+      const { run, sandbox } = await startRun(task, "execute", session.sandbox);
+      startLoop(agent, task.id, "execute", run, taskBrief(task) + networkNote(session.domains) + rework, {
+        tools: [...agent.getTools(), ...createCodingTools(session.dir, sandbox)],
       });
     },
   },
@@ -222,8 +238,9 @@ const reviewImplementedTask: SituationHandler = {
       const session = await sessionFor(task);
       if (!session) return;
       const summary = task.result ? `\n\n## Implementer's summary\n\n${task.result}` : "";
-      startLoop(agent, task.id, "review", `Review the implementation of this task.\n\n${taskBrief(task)}${networkNote(session.domains)}${summary}`, {
-        tools: [...agent.getTools(), ...createCodingTools(session.dir, session.sandbox).filter((tool) => REVIEW_TOOLS.has(tool.name))],
+      const { run, sandbox } = await startRun(task, "review", session.sandbox);
+      startLoop(agent, task.id, "review", run, `Review the implementation of this task.\n\n${taskBrief(task)}${networkNote(session.domains)}${summary}`, {
+        tools: [...agent.getTools(), ...createCodingTools(session.dir, sandbox).filter((tool) => REVIEW_TOOLS.has(tool.name))],
         structuredOutput: REVIEW_FORMAT,
       });
     },
@@ -243,10 +260,12 @@ const trackLoop: SituationHandler = {
 };
 
 /** The board owns the task lifecycle: execution -> review -> (back to execution | done), driven by each agent's answer. */
-async function advanceTask({ taskId, role }: Session, text: string) {
+async function advanceTask({ taskId, role, run }: Session, text: string) {
   const { state } = resolveRuntime();
   const error = state.failures.get(taskId);
   state.failures.delete(taskId);
+  const review = role === "review" && !error ? parseReview(text) : undefined;
+  void run.end(error ?? (role === "review" && !review ? "Reviewer returned an invalid review" : undefined));
   if (error) {
     addActivity(taskId, { kind: "error", role, title: "Agent failed", detail: error });
     endSession(taskId);
@@ -260,7 +279,6 @@ async function advanceTask({ taskId, role }: Session, text: string) {
     return emit<ReviewRequestedPayload>("task.review_requested", { task });
   }
 
-  const review = parseReview(text);
   if (!review) {
     addActivity(taskId, { kind: "error", role, title: "Reviewer returned an invalid review", detail: text });
     endSession(taskId);
@@ -351,6 +369,8 @@ const trackActivity: SituationHandler = {
         if (narration && items.some((item) => item.type === "function_call")) addActivity(taskId, { kind: "message", role, title: narration });
       } else if (event.type === "function_call.started") {
         const { call } = event.payload as FunctionCallStartedPayload;
+        // Published synchronously right before the tool runs, so its docker_exec span gets this call id.
+        session.run.setToolCallId(call.callId);
         const { title, detail } = describeToolCall(call.name, call.args);
         state.toolByCall.set(call.callId, { id: addActivity(taskId, { kind: "tool", role, tool: call.name, title, detail, status: "running" }), name: call.name });
       } else {

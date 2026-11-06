@@ -1,0 +1,188 @@
+import { randomUUID } from "node:crypto";
+import { diag, DiagConsoleLogger, DiagLogLevel, ROOT_CONTEXT, SpanKind, SpanStatusCode, trace, type Attributes, type Span } from "@opentelemetry/api";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+import { resourceFromAttributes } from "@opentelemetry/resources";
+import { BatchSpanProcessor, TracerProvider } from "@opentelemetry/sdk-trace";
+import { version } from "../../package.json";
+import { execFileAsync } from "./docker";
+
+/**
+ * OpenTelemetry tracing of agent sessions for Dash0 AI SDLC Insights, enabled when DASH0_OTLP_ENDPOINT and DASH0_AUTH_TOKEN are set.
+ * Each agent run is one session (`gen_ai.conversation.id`) with its own tracer provider, so the session attributes are both resource
+ * and span attributes. Only metadata is exported: never prompts, messages, tool arguments or tool output.
+ */
+
+export type AgentName = "implement" | "review" | "merge";
+
+export type VcsInfo = { branch: string; revision?: string; remoteUrl?: string; pullRequestUrl?: string; issueUrl?: string };
+
+export type AgentRunOptions = { agentName: AgentName; vcs: VcsInfo; model?: string; provider?: string };
+
+type TokenUsage = { inputTokens: number; outputTokens: number };
+
+const SERVICE_NAME = "software-factory";
+const HARNESS_NAME = "mozaik";
+// AI SDLC Insights only counts sessions from this instrumentation scope (the one Dash0's own agent plugin uses).
+const SCOPE_NAME = "dash0-agent-plugin";
+
+function exporterConfig() {
+  const endpoint = process.env.DASH0_OTLP_ENDPOINT?.trim();
+  const token = process.env.DASH0_AUTH_TOKEN?.trim();
+  if (!endpoint || !token) return undefined;
+  const dataset = process.env.DASH0_DATASET?.trim();
+  return {
+    url: `${endpoint.replace(/\/+$/, "").replace(/\/v1\/traces$/, "")}/v1/traces`,
+    headers: { Authorization: `Bearer ${token}`, ...(dataset && { "Dash0-Dataset": dataset }) },
+  };
+}
+
+const gitValue = (args: string[]) => execFileAsync("git", args).then(({ stdout }) => stdout.trim() || undefined, () => undefined);
+
+let userName: Promise<string | undefined> | undefined;
+let factoryRemote: Promise<string | undefined> | undefined;
+
+/** Splits a GitHub remote (ssh or https) into owner, name and its https URL. */
+export function parseRemote(remote: string) {
+  const match = remote.trim().match(/^(?:[a-z+]+:\/\/)?(?:[^@/]+@)?([^/:]+)[:/](.+?)\/([^/]+?)(?:\.git)?\/?$/i);
+  if (!match) return undefined;
+  const [, host, owner, name] = match;
+  return { owner, name, url: `https://${host}/${owner}/${name}` };
+}
+
+function vcsAttributes(vcs: VcsInfo, remoteUrl: string | undefined): Attributes {
+  const repo = remoteUrl ? parseRemote(remoteUrl) : undefined;
+  return {
+    "dash0.gen_ai.vcs.provider.name": "github",
+    "dash0.gen_ai.vcs.ref.head.name": vcs.branch,
+    "dash0.gen_ai.vcs.ref.head.type": "branch",
+    "dash0.gen_ai.vcs.ref.head.revision": vcs.revision,
+    "dash0.gen_ai.vcs.repository.name": repo?.name,
+    "dash0.gen_ai.vcs.repository.url.full": repo?.url,
+    "dash0.gen_ai.vcs.owner.name": repo?.owner,
+    "dash0.gen_ai.vcs.pull_request.url": vcs.pullRequestUrl,
+    "dash0.gen_ai.vcs.issue.url": vcs.issueUrl,
+  };
+}
+
+const defined = (attributes: Attributes) => Object.fromEntries(Object.entries(attributes).filter(([, v]) => v !== undefined)) as Attributes;
+
+export class AgentRun {
+  readonly conversationId = randomUUID();
+  private readonly provider?: TracerProvider;
+  private readonly root: Span;
+  private readonly attributes: Attributes;
+  private pendingToolCallId?: string;
+  private ended = false;
+
+  private constructor(private readonly options: AgentRunOptions, config: ReturnType<typeof exporterConfig>, extra: Attributes) {
+    this.attributes = defined({
+      "service.name": SERVICE_NAME,
+      "service.version": version,
+      "gen_ai.harness.name": process.env.DASH0_HARNESS_NAME?.trim() || HARNESS_NAME,
+      "gen_ai.agent.name": options.agentName,
+      "gen_ai.provider.name": options.provider,
+      "gen_ai.conversation.id": this.conversationId,
+      ...extra,
+    });
+    if (config) {
+      this.provider = new TracerProvider({
+        resource: resourceFromAttributes(this.attributes),
+        spanProcessors: [new BatchSpanProcessor({ exporter: new OTLPTraceExporter(config) })],
+      });
+    }
+    this.root = this.startSpan(`invoke_agent ${options.agentName}`, SpanKind.INTERNAL, {
+      "gen_ai.operation.name": "invoke_agent",
+      "gen_ai.request.model": options.model,
+    });
+  }
+
+  /** Starts a session span tree; a no-op (non-recording spans) when Dash0 isn't configured. */
+  static async start(options: AgentRunOptions) {
+    const config = exporterConfig();
+    if (!config) return new AgentRun(options, undefined, {});
+    // Surfaces export failures (bad endpoint or token) without logging request contents.
+    diag.setLogger(new DiagConsoleLogger(), { logLevel: DiagLogLevel.WARN, suppressOverrideMessage: true });
+    const [user, fallbackRemote] = await Promise.all([
+      (userName ??= gitValue(["config", "user.name"])),
+      options.vcs.remoteUrl ? undefined : (factoryRemote ??= gitValue(["remote", "get-url", "origin"])),
+    ]);
+    return new AgentRun(options, config, { "user.name": user, ...vcsAttributes(options.vcs, options.vcs.remoteUrl ?? fallbackRemote) });
+  }
+
+  private startSpan(name: string, kind: SpanKind, attributes: Attributes, parent?: Span) {
+    const tracer = this.provider?.getTracer(SCOPE_NAME, version) ?? trace.getTracer(SCOPE_NAME);
+    const context = parent ? trace.setSpan(ROOT_CONTEXT, parent) : ROOT_CONTEXT;
+    return tracer.startSpan(name, { kind, attributes: defined({ ...this.attributes, ...attributes }) }, context);
+  }
+
+  private async traced<T>(span: Span, fn: () => Promise<T>, onResult: (result: T) => void) {
+    try {
+      const result = await fn();
+      onResult(result);
+      return result;
+    } catch (error) {
+      fail(span, error);
+      throw error;
+    } finally {
+      span.end();
+    }
+  }
+
+  /** One model turn: a `chat` span with the model and token counts. */
+  modelTurn<T extends { tokenUsage?: TokenUsage }>(fn: () => Promise<T>) {
+    const model = this.options.model;
+    const span = this.startSpan(`chat ${model ?? ""}`.trim(), SpanKind.CLIENT, { "gen_ai.operation.name": "chat", "gen_ai.request.model": model }, this.root);
+    return this.traced(span, fn, ({ tokenUsage }) => {
+      if (!tokenUsage) return;
+      span.setAttributes({ "gen_ai.usage.input_tokens": tokenUsage.inputTokens, "gen_ai.usage.output_tokens": tokenUsage.outputTokens });
+    });
+  }
+
+  /** Records the id of the tool call the model just made, so the next tool span carries it. */
+  setToolCallId(callId: string) {
+    this.pendingToolCallId = callId;
+  }
+
+  /** One tool execution: an `execute_tool` span; `failure` returns an error description for results that count as failed. */
+  executeTool<T>(name: string, fn: () => Promise<T>, failure: (result: T) => string | undefined) {
+    const callId = this.pendingToolCallId ?? randomUUID();
+    this.pendingToolCallId = undefined;
+    const span = this.startSpan(`execute_tool ${name}`, SpanKind.INTERNAL, {
+      "gen_ai.operation.name": "execute_tool",
+      "gen_ai.tool.name": name,
+      "gen_ai.tool.type": "function",
+      "gen_ai.tool.call.id": callId,
+    }, this.root);
+    return this.traced(span, fn, (result) => {
+      const error = failure(result);
+      if (error) fail(span, new Error(error));
+    });
+  }
+
+  /** Wraps a whole non-model step (e.g. merging) in the session's root span. */
+  async run<T>(fn: () => Promise<T>) {
+    try {
+      const result = await fn();
+      await this.end();
+      return result;
+    } catch (error) {
+      await this.end(error);
+      throw error;
+    }
+  }
+
+  /** Ends the session and flushes its spans; `error` marks the session failed. */
+  async end(error?: unknown) {
+    if (this.ended) return;
+    this.ended = true;
+    if (error !== undefined) fail(this.root, error);
+    this.root.end();
+    await this.provider?.shutdown().catch((e) => console.error("[tracing] failed to flush spans", e));
+  }
+}
+
+function fail(span: Span, error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  span.setStatus({ code: SpanStatusCode.ERROR, message: message.slice(0, 500) });
+  span.setAttribute("error.type", error instanceof Error ? error.name : "Error");
+}

@@ -126,6 +126,17 @@ export async function ensureWorktree(task: Task) {
 
 export const hasWorktree = (task: Task) => existsSync(worktreeDir(task));
 
+/** Branch, HEAD commit and origin remote (if any) of a task's checkout, for tracing. */
+export async function taskVcs(task: Task) {
+  const optional = (run: Promise<string>) => run.then((out) => out.trim() || undefined, () => undefined);
+  const [revision, remoteUrl] = await Promise.all([
+    hasWorktree(task) ? optional(worktreeGit(task, ["rev-parse", "HEAD"])) : undefined,
+    optional(git(repoDir(task.projectId), ["remote", "get-url", "origin"])),
+  ]);
+  const base = process.env.FACTORY_PUBLIC_URL?.replace(/\/+$/, "");
+  return { branch: branchName(task), revision, remoteUrl, issueUrl: base && `${base}/projects/${task.projectId}?task=${task.id}` };
+}
+
 /** Everything the agents changed on the task branch, including uncommitted and new files. */
 export async function taskDiff(task: Task): Promise<DiffFile[]> {
   if (!hasWorktree(task)) return [];

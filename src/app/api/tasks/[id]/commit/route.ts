@@ -1,6 +1,7 @@
 import { stopPreview, taskPreviewTarget } from "@/lib/preview";
 import { getTask, updateTask } from "@/lib/task-store";
-import { commitAndMergeTask } from "@/lib/workspace";
+import { AgentRun } from "@/lib/tracing";
+import { commitAndMergeTask, taskVcs } from "@/lib/workspace";
 
 export async function POST(request: Request, ctx: RouteContext<"/api/tasks/[id]/commit">) {
   const task = await getTask((await ctx.params).id);
@@ -11,7 +12,8 @@ export async function POST(request: Request, ctx: RouteContext<"/api/tasks/[id]/
 
   await stopPreview(taskPreviewTarget(task));
   try {
-    const mergedCommit = await commitAndMergeTask(task, commitMessage);
+    const run = await AgentRun.start({ agentName: "merge", vcs: await taskVcs(task) });
+    const mergedCommit = await run.run(() => commitAndMergeTask(task, commitMessage));
     return Response.json(await updateTask(task.id, { mergedCommit, branch: undefined }));
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 409 });
