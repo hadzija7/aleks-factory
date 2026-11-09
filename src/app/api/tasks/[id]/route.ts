@@ -3,7 +3,7 @@ import { executeTask, reviewTask } from "@/lib/agent";
 import { stopPreview, taskPreviewTarget } from "@/lib/preview";
 import { getProject } from "@/lib/project-store";
 import { deleteTask, getTask, updateTask } from "@/lib/task-store";
-import { isAgentBusy, isTaskStatus } from "@/lib/tasks";
+import { isTaskBusy, isTaskStatus } from "@/lib/tasks";
 import { removeWorktree } from "@/lib/workspace";
 
 export async function PATCH(request: Request, ctx: RouteContext<"/api/tasks/[id]">) {
@@ -13,7 +13,7 @@ export async function PATCH(request: Request, ctx: RouteContext<"/api/tasks/[id]
 
   const current = await getTask(id);
   if (!current) return Response.json({ error: "not found" }, { status: 404 });
-  if (isAgentBusy(current.status)) {
+  if (isTaskBusy(current)) {
     return Response.json({ error: "an agent is working on this task" }, { status: 409 });
   }
   const startsAgent = status === "in_progress" || status === "in_review";
@@ -23,7 +23,7 @@ export async function PATCH(request: Request, ctx: RouteContext<"/api/tasks/[id]
 
   const patch =
     status === "in_progress"
-      ? { status, result: undefined, review: undefined, reviewRounds: 0, mergedCommit: undefined, error: undefined }
+      ? { status, result: undefined, review: undefined, reviewRounds: 0, rework: undefined, mergedCommit: undefined, error: undefined }
       : status === "in_review"
         ? { status, review: undefined, error: undefined }
         : { status };
@@ -38,7 +38,7 @@ export async function DELETE(_request: Request, ctx: RouteContext<"/api/tasks/[i
   const { id } = await ctx.params;
   const current = await getTask(id);
   if (!current) return Response.json({ error: "not found" }, { status: 404 });
-  if (isAgentBusy(current.status)) {
+  if (isTaskBusy(current)) {
     return Response.json({ error: "an agent is working on this task" }, { status: 409 });
   }
   await stopPreview(taskPreviewTarget(current));

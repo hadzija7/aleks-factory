@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { COLUMNS, isAgentBusy, type Task, type TaskStatus } from "@/lib/tasks";
+import { COLUMNS, isTaskBusy, type Task, type TaskStatus } from "@/lib/tasks";
 import { ActivityFeed } from "./activity-feed";
 import { DiffViewer } from "./diff-viewer";
 import { PreviewControl } from "./preview-control";
@@ -119,8 +119,20 @@ export function KanbanBoard({ projectId }: { projectId: string }) {
   );
 }
 
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+/** What's happening to a busy task, for its card. */
+function busyLabel(task: Task) {
+  if (task.checking) return `${task.checking}…`;
+  if (task.status === "in_review") return "Reviewing…";
+  if (task.conflicts?.length) return `Resolving merge conflicts with main (${plural(task.conflicts.length, "file")})…`;
+  if (!task.reviewRounds) return "Agent working…";
+  if (task.rework === "checks") return `Fixing checks broken by the latest main (round ${task.reviewRounds})…`;
+  return `Fixing review findings (round ${task.reviewRounds})…`;
+}
+
 function TaskCard({ task, onOpen, onReview, onDelete }: { task: Task; onOpen: () => void; onReview: () => void; onDelete: () => void }) {
-  const running = isAgentBusy(task.status);
+  const running = isTaskBusy(task);
   return (
     <article
       draggable={!running}
@@ -145,9 +157,9 @@ function TaskCard({ task, onOpen, onReview, onDelete }: { task: Task; onOpen: ()
       </div>
       {task.description && <p className="mt-1 line-clamp-2 text-sm opacity-70">{task.description}</p>}
       {running && (
-        <p className="mt-2 flex items-center gap-2 text-xs text-blue-600">
-          <span className="h-2 w-2 animate-pulse rounded-full bg-blue-600" />
-          {task.status === "in_review" ? "Reviewing…" : task.reviewRounds ? `Fixing review findings (round ${task.reviewRounds})…` : "Agent working…"}
+        <p className={`mt-2 flex items-center gap-2 text-xs ${task.checking ? "text-amber-600" : "text-blue-600"}`}>
+          <span className={`h-2 w-2 animate-pulse rounded-full ${task.checking ? "bg-amber-600" : "bg-blue-600"}`} />
+          {busyLabel(task)}
         </p>
       )}
       {running && task.currentStep && (
@@ -161,7 +173,7 @@ function TaskCard({ task, onOpen, onReview, onDelete }: { task: Task; onOpen: ()
           merged {task.mergedCommit}
         </p>
       )}
-      {task.status === "done" && hasWork(task) && (
+      {task.status === "done" && hasWork(task) && !running && (
         <div className="mt-3 flex flex-wrap items-start gap-2" onClick={(e) => e.stopPropagation()}>
           <button onClick={onReview} className="rounded-md bg-foreground px-2.5 py-1 text-xs font-medium text-background hover:opacity-90">
             Review & commit
@@ -189,7 +201,7 @@ function TaskDetails({ task, onClose, onReview }: { task: Task; onClose: () => v
           {task.branch && <span className="ml-2 font-mono normal-case">· {task.branch}</span>}
           {task.mergedCommit && <span className="ml-2 font-mono normal-case text-green-600">· merged {task.mergedCommit}</span>}
         </p>
-        {hasWork(task) && !isAgentBusy(task.status) && (
+        {hasWork(task) && !isTaskBusy(task) && (
           <div className="mt-4 flex flex-wrap items-start gap-2">
             <button onClick={onReview} className="rounded-md bg-foreground px-3 py-1 text-xs font-medium text-background hover:opacity-90">
               {task.status === "done" ? "Review & commit" : "View changes"}

@@ -47,11 +47,12 @@ describe("AgentRun", () => {
       agentName: "implement",
       model: "gpt-5.5",
       provider: "openai",
-      vcs: { branch: "task/abcd1234", revision: "deadbeef", remoteUrl: "git@github.com:acme/widgets.git", issueUrl: "http://localhost:3000/projects/p?task=t" },
+      vcs: { branch: "task/abcd1234", startingCommit: "deadbeef", remoteUrl: "git@github.com:acme/widgets.git", issueUrl: "http://localhost:3000/projects/p?task=t" },
     });
     await run.modelTurn(async () => ({ tokenUsage: { inputTokens: 120, outputTokens: 30 }, secret: "PROMPT BODY" }));
     run.setToolCallId("call_1");
     await run.executeTool("docker_exec", async () => ({ ok: false, exitCode: 2, stdout: "TOOL OUTPUT" }), (r) => (r.ok ? undefined : `exit ${r.exitCode}`));
+    run.setAttributes({ "dash0.gen_ai.vcs.ref.head.merge_commit": "cafef00d" });
     await run.end();
 
     expect(requests).toHaveLength(1);
@@ -80,7 +81,7 @@ describe("AgentRun", () => {
         "gen_ai.conversation.id": run.conversationId,
         "dash0.gen_ai.vcs.ref.head.name": "task/abcd1234",
         "dash0.gen_ai.vcs.ref.head.type": "branch",
-        "dash0.gen_ai.vcs.ref.head.revision": "deadbeef",
+        "dash0.gen_ai.vcs.ref.head.starting_commit": "deadbeef",
         "dash0.gen_ai.vcs.repository.name": "widgets",
         "dash0.gen_ai.vcs.repository.url.full": "https://github.com/acme/widgets",
         "dash0.gen_ai.vcs.owner.name": "acme",
@@ -90,6 +91,7 @@ describe("AgentRun", () => {
       expect(Object.keys(attrs(span.attributes))).not.toContain("gen_ai.input.messages");
     }
     expect(attrs(byOp.chat.attributes)).toMatchObject({ "gen_ai.request.model": "gpt-5.5", "gen_ai.usage.input_tokens": 120, "gen_ai.usage.output_tokens": 30 });
+    expect(attrs(root.attributes)["dash0.gen_ai.vcs.ref.head.merge_commit"]).toBe("cafef00d");
     expect(byOp.chat.parentSpanId).toBe(root.spanId);
     expect(attrs(byOp.execute_tool.attributes)).toMatchObject({ "gen_ai.tool.name": "docker_exec", "gen_ai.tool.type": "function", "gen_ai.tool.call.id": "call_1" });
     expect(byOp.execute_tool.status?.code).toBe(2);

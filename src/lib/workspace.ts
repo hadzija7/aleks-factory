@@ -36,8 +36,16 @@ async function git(cwd: string, args: string[]) {
  * Git commands for a task's worktree. The admin dir is passed explicitly instead of trusting the `.git` file inside the
  * worktree, which the agent can overwrite (e.g. to point git at a config that runs host commands).
  */
-const worktreeGit = (task: Task, args: string[]) =>
-  git(worktreeDir(task), ["--git-dir", worktreeGitDir(task), "--work-tree", worktreeDir(task), ...args]);
+const worktreeGit = (task: Task, args: string[]) => {
+  // One command at a time per worktree: concurrent writers (e.g. two diff requests staging at once) fail on index.lock.
+  const dir = worktreeDir(task);
+  const run = (worktreeQueues.get(dir) ?? Promise.resolve()).then(() => git(dir, ["--git-dir", worktreeGitDir(task), "--work-tree", dir, ...args]));
+  const tail = run.catch(() => {});
+  worktreeQueues.set(dir, tail);
+  void tail.then(() => worktreeQueues.get(dir) === tail && worktreeQueues.delete(dir));
+  return run;
+};
+const worktreeQueues = new Map<string, Promise<unknown>>();
 
 export async function bootstrapProject(project: Project) {
   const dir = repoDir(project.id);
@@ -70,8 +78,11 @@ async function localEnvFiles(dir: string, runGit: (args: string[]) => Promise<st
   return names.filter((_, i) => regular[i]);
 }
 
-/** Copies env files from one checkout to another; for files that already exist, keys from `fromDir` win and other keys are kept. */
-async function syncEnvFiles(fromDir: string, names: string[], toDir: string) {
+/**
+ * Copies env files from one checkout to another; for files that already exist, keys from `fromDir` win (or, with
+ * `onlyMissing`, only keys `toDir` lacks are added) and other keys are kept.
+ */
+async function syncEnvFiles(fromDir: string, names: string[], toDir: string, onlyMissing = false) {
   for (const name of names) {
     const source = await readFile(path.join(fromDir, name), "utf8");
     const target = path.join(toDir, name);
@@ -86,7 +97,7 @@ async function syncEnvFiles(fromDir: string, names: string[], toDir: string) {
       if (!key) continue;
       const index = lines.findIndex((l) => l.match(ENV_LINE)?.[1] === key);
       if (index === -1) lines.splice(lines.at(-1) === "" ? lines.length - 1 : lines.length, 0, line);
-      else lines[index] = line;
+      else if (!onlyMissing) lines[index] = line;
     }
     await writeFile(target, lines.join("\n"));
   }
@@ -129,12 +140,12 @@ export const hasWorktree = (task: Task) => existsSync(worktreeDir(task));
 /** Branch, HEAD commit and origin remote (if any) of a task's checkout, for tracing. */
 export async function taskVcs(task: Task) {
   const optional = (run: Promise<string>) => run.then((out) => out.trim() || undefined, () => undefined);
-  const [revision, remoteUrl] = await Promise.all([
+  const [startingCommit, remoteUrl] = await Promise.all([
     hasWorktree(task) ? optional(worktreeGit(task, ["rev-parse", "HEAD"])) : undefined,
     optional(git(repoDir(task.projectId), ["remote", "get-url", "origin"])),
   ]);
   const base = process.env.FACTORY_PUBLIC_URL?.replace(/\/+$/, "");
-  return { branch: branchName(task), revision, remoteUrl, issueUrl: base && `${base}/projects/${task.projectId}?task=${task.id}` };
+  return { branch: branchName(task), startingCommit, remoteUrl, issueUrl: base && `${base}/projects/${task.projectId}?task=${task.id}` };
 }
 
 /** Everything the agents changed on the task branch, including uncommitted and new files. */
@@ -146,27 +157,98 @@ export async function taskDiff(task: Task): Promise<DiffFile[]> {
   return parseDiff(await worktreeGit(task, ["diff", "--cached", "--no-color", "--no-ext-diff", "-M", base]));
 }
 
-/** Commits the task's changes on its branch, merges it into main and removes the worktree. Returns the short commit SHA. */
-export async function commitAndMergeTask(task: Task, message: string) {
-  if (!hasWorktree(task)) throw new Error("This task has no workspace to commit");
+export class MergeConflictError extends Error {
+  constructor(readonly files: string[]) {
+    super(`Merging main into the task branch conflicts in ${files.join(", ")}`);
+  }
+}
+
+const CONFLICT_MARKER = /^(<{7}|>{7})( |$)/m;
+
+/** Stages everything in the worktree and commits it if anything changed. */
+async function commitWorktree(task: Task, message: string) {
   await worktreeGit(task, ["add", "-A"]);
   const hasStaged = await worktreeGit(task, ["diff", "--cached", "--quiet"]).then(() => false, () => true);
   if (hasStaged) await worktreeGit(task, ["commit", "-m", message]);
+  return hasStaged;
+}
+
+const unmergedFiles = async (task: Task) =>
+  (await worktreeGit(task, ["diff", "--name-only", "--diff-filter=U"])).split("\n").filter(Boolean);
+
+/** Files that still contain conflict markers (missing files count as resolved). */
+async function filesWithMarkers(task: Task, files: string[]) {
+  const dir = worktreeDir(task);
+  const marked = await Promise.all(
+    files.map(async (file) => (await isRegularFile(path.join(dir, file))) && CONFLICT_MARKER.test(await readFile(path.join(dir, file), "utf8"))),
+  );
+  return files.filter((_, i) => marked[i]);
+}
+
+/**
+ * Brings main into the task branch so the work merges cleanly later: snapshots the agents' changes, merges main and, when
+ * a previous merge stopped on conflicts, concludes it once no conflicted file has markers left. Returns the files still
+ * in conflict; the merge is then left in progress (markers in the worktree) for the executor to resolve.
+ */
+export async function syncWithMain(task: Task, knownConflicts: string[] = []) {
+  // Secrets added to main after the worktree was created (e.g. merged from another task) reach it here too.
+  const repo = repoDir(task.projectId);
+  await syncEnvFiles(repo, await localEnvFiles(repo, (args) => git(repo, args)), worktreeDir(task), true);
+  if (existsSync(path.join(worktreeGitDir(task), "MERGE_HEAD"))) {
+    const conflicted = [...new Set([...knownConflicts, ...(await unmergedFiles(task))])];
+    const unresolved = await filesWithMarkers(task, conflicted);
+    if (unresolved.length) return unresolved;
+    await worktreeGit(task, ["add", "-A"]);
+    await worktreeGit(task, ["commit", "--no-edit"]);
+  }
+  await commitWorktree(task, `WIP: ${task.title}`);
+  const upToDate = await worktreeGit(task, ["merge-base", "--is-ancestor", "main", "HEAD"]).then(() => true, () => false);
+  if (upToDate) return [];
+  try {
+    await worktreeGit(task, ["merge", "--no-edit", "main"]);
+    return [];
+  } catch (error) {
+    const conflicts = await unmergedFiles(task);
+    if (conflicts.length) return conflicts;
+    await worktreeGit(task, ["merge", "--abort"]).catch(() => {});
+    throw new Error(`Merging main into ${branchName(task)} failed:\n${errorMessage(error)}`);
+  }
+}
+
+export const headRevision = async (task: Task) => (await worktreeGit(task, ["rev-parse", "HEAD"])).trim();
+
+/** Files that differ between `revision` and the task branch's HEAD. */
+export const changedSince = async (task: Task, revision: string) =>
+  (await worktreeGit(task, ["diff", "--name-only", revision, "HEAD"])).split("\n").filter(Boolean);
+
+/**
+ * Commits the task's changes as one commit on top of main, merges it into main and removes the worktree.
+ * Throws MergeConflictError when main has moved on in a conflicting way. Returns the task commit's short SHA and the
+ * full SHA of the merge commit on main.
+ */
+export async function commitAndMergeTask(task: Task, message: string) {
+  if (!hasWorktree(task)) throw new Error("This task has no workspace to commit");
+  const conflicts = await syncWithMain(task, task.conflicts);
+  if (conflicts.length) throw new MergeConflictError(conflicts);
+  // The branch now contains main, so squash its snapshot and sync commits into a single commit with the user's message.
+  await worktreeGit(task, ["reset", "--soft", "main"]);
+  if (!(await commitWorktree(task, message))) throw new Error("No changes to commit");
 
   const repo = repoDir(task.projectId);
   const branch = branchName(task);
-  if ((await git(repo, ["rev-list", "--count", `main..${branch}`])).trim() === "0") throw new Error("No changes to commit");
   try {
     await git(repo, ["merge", "--no-ff", "-m", `Merge ${branch}: ${task.title}`, branch]);
   } catch (error) {
     await git(repo, ["merge", "--abort"]).catch(() => {});
     throw new Error(`Merging ${branch} into main failed, likely a conflict with work merged since:\n${errorMessage(error)}`);
   }
-  const sha = (await git(repo, ["rev-parse", "--short", branch])).trim();
+  const [commit, mergeCommit] = (
+    await Promise.all([git(repo, ["rev-parse", "--short", branch]), git(repo, ["rev-parse", "--verify", "main"])])
+  ).map((sha) => sha.trim());
   // Env files are gitignored, so carry the task's secrets over to main before its worktree is deleted.
   await syncEnvFiles(worktreeDir(task), await localEnvFiles(worktreeDir(task), (args) => worktreeGit(task, args)), repo);
   await removeWorktree(task);
-  return sha;
+  return { commit, mergeCommit };
 }
 
 export async function removeWorktree(task: Task) {

@@ -4,7 +4,7 @@ import { mainPreviewTarget, stopPreview, taskPreviewTarget } from "@/lib/preview
 import { deleteProject, getProject, updateProject } from "@/lib/project-store";
 import { normalizeDomain } from "@/lib/projects";
 import { deleteProjectTasks, listTasks } from "@/lib/task-store";
-import { isAgentBusy } from "@/lib/tasks";
+import { isTaskBusy } from "@/lib/tasks";
 import { removeProjectFiles } from "@/lib/workspace";
 
 export async function GET(_request: Request, ctx: RouteContext<"/api/projects/[id]">) {
@@ -30,7 +30,7 @@ export async function DELETE(_request: Request, ctx: RouteContext<"/api/projects
   const project = await getProject(id);
   if (!project) return Response.json({ error: "not found" }, { status: 404 });
   const tasks = await listTasks(id);
-  if (project.status === "bootstrapping" || tasks.some((task) => isAgentBusy(task.status))) {
+  if (project.status === "bootstrapping" || tasks.some(isTaskBusy)) {
     return Response.json({ error: "wait for running agents and setup to finish" }, { status: 409 });
   }
   await Promise.all([stopPreview(mainPreviewTarget(id)), ...tasks.map((task) => stopPreview(taskPreviewTarget(task)))]);

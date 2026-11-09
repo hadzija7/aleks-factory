@@ -11,6 +11,12 @@ export type Task = {
   result?: string;
   review?: string;
   reviewRounds?: number;
+  /** Files that conflicted when main was merged into the task branch; set while the executor resolves them. */
+  conflicts?: string[];
+  /** Why the task was last sent back to the executor. */
+  rework?: "review" | "conflicts" | "checks";
+  /** What the board is checking on a done task after main moved; only filled in by the API while it runs. */
+  checking?: string;
   /** Git branch with the task's work; set once its worktree exists, cleared when merged. */
   branch?: string;
   /** Short SHA of the commit merged into main. */
@@ -35,3 +41,6 @@ export const isTaskStatus = (value: unknown): value is TaskStatus =>
 
 /** Statuses during which an agent owns the task, so the board must not move or delete it. */
 export const isAgentBusy = (status: TaskStatus) => status === "in_progress" || status === "in_review";
+
+/** Busy with an agent or with the board re-checking it against main. */
+export const isTaskBusy = (task: Task) => isAgentBusy(task.status) || !!task.checking;

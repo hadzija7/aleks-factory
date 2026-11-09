@@ -3,14 +3,14 @@ import { currentStep } from "@/lib/activity";
 import { getActivity } from "@/lib/activity-log";
 import { getProject } from "@/lib/project-store";
 import { createTask, listTasks } from "@/lib/task-store";
-import { isAgentBusy } from "@/lib/tasks";
+import { isTaskBusy } from "@/lib/tasks";
 
 export async function GET(request: Request) {
   await connection();
   const projectId = new URL(request.url).searchParams.get("projectId");
   if (!projectId) return Response.json({ error: "projectId is required" }, { status: 400 });
   const tasks = await listTasks(projectId);
-  return Response.json(tasks.map((task) => (isAgentBusy(task.status) ? { ...task, currentStep: currentStep(getActivity(task.id)) } : task)));
+  return Response.json(tasks.map((task) => (isTaskBusy(task) ? { ...task, currentStep: currentStep(getActivity(task.id)) } : task)));
 }
 
 export async function POST(request: Request) {

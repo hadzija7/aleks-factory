@@ -14,7 +14,7 @@ import { execFileAsync } from "./docker";
 
 export type AgentName = "implement" | "review" | "merge";
 
-export type VcsInfo = { branch: string; revision?: string; remoteUrl?: string; pullRequestUrl?: string; issueUrl?: string };
+export type VcsInfo = { branch: string; startingCommit?: string; remoteUrl?: string; pullRequestUrl?: string; issueUrl?: string };
 
 export type AgentRunOptions = { agentName: AgentName; vcs: VcsInfo; model?: string; provider?: string };
 
@@ -55,7 +55,7 @@ function vcsAttributes(vcs: VcsInfo, remoteUrl: string | undefined): Attributes 
     "dash0.gen_ai.vcs.provider.name": "github",
     "dash0.gen_ai.vcs.ref.head.name": vcs.branch,
     "dash0.gen_ai.vcs.ref.head.type": "branch",
-    "dash0.gen_ai.vcs.ref.head.revision": vcs.revision,
+    "dash0.gen_ai.vcs.ref.head.starting_commit": vcs.startingCommit,
     "dash0.gen_ai.vcs.repository.name": repo?.name,
     "dash0.gen_ai.vcs.repository.url.full": repo?.url,
     "dash0.gen_ai.vcs.owner.name": repo?.owner,
@@ -157,6 +157,11 @@ export class AgentRun {
       const error = failure(result);
       if (error) fail(span, new Error(error));
     });
+  }
+
+  /** Adds attributes learned during the run (e.g. the merge commit) to the session's root span. */
+  setAttributes(attributes: Attributes) {
+    this.root.setAttributes(defined(attributes));
   }
 
   /** Wraps a whole non-model step (e.g. merging) in the session's root span. */

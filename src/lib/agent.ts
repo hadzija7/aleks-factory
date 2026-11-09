@@ -24,10 +24,11 @@ import { DockerSandbox } from "./docker-sandbox";
 import { closeEgress, openEgress } from "./egress";
 import { getProject } from "./project-store";
 import { DEFAULT_ALLOWED_DOMAINS } from "./projects";
-import { updateTask } from "./task-store";
+import { setTaskCheck } from "./task-checks";
+import { listTasks, updateTask } from "./task-store";
 import type { Task } from "./tasks";
 import { AgentRun, type AgentName } from "./tracing";
-import { ensureWorktree, hasWorktree, taskKey, taskVcs } from "./workspace";
+import { changedSince, ensureWorktree, hasWorktree, headRevision, syncWithMain, taskKey, taskVcs, worktreeDir } from "./workspace";
 
 const MODEL = process.env.MOZAIK_MODEL ?? "gpt-5.5";
 const PROVIDER = supportedModels.find((m) => m.specification.name === MODEL)?.specification.provider;
@@ -44,6 +45,7 @@ Dependencies are already installed (\`npm install <pkg>\` works while the npm re
 so inspect it with run_command rather than read_file. \`next build\` can fail fetching Google Fonts unless fonts.googleapis.com is allowed;
 lint and \`npx tsc --noEmit\` always work.
 Do not run git commands: the board commits and merges your work after a human reviews it.
+If the task lists merge conflicts with main, edit each listed file to combine both sides and remove every conflict marker; the board concludes the merge.
 Secrets: when the task gives you API keys, tokens or other credentials, write them to \`.env.local\` at the project root
 (create or update it with write_file/edit_file, one NAME=value per line) and read them via \`process.env.NAME\` in server-side code only.
 Never hardcode secrets in source files, expose them to the browser (no NEXT_PUBLIC_ prefix, no client components), or print them in commands.
@@ -194,6 +196,14 @@ function startLoop(agent: Agent, taskId: string, role: Role, run: AgentRun, mess
   runLoop(agent.getId(), message, { model: MODEL, context, ...input });
 }
 
+type Rework = NonNullable<Task["rework"]>;
+
+const REWORK: Record<Rework, { phase: string; heading: string }> = {
+  review: { phase: "Executor fixing review findings", heading: "Code review findings to fix" },
+  conflicts: { phase: "Executor resolving merge conflicts with main", heading: "Merge conflicts to resolve" },
+  checks: { phase: "Executor fixing checks broken by the latest main", heading: "Checks failing after merging the latest main" },
+};
+
 const taskBrief = (task: Task) => `# ${task.title}\n\n${task.description}`;
 
 const formatReview = ({ verdict, summary, findings }: Review) =>
@@ -214,12 +224,12 @@ const executeAssignedTask: SituationHandler = {
     async apply({ event, participant }) {
       const agent = participant as Agent;
       const { task } = event.payload as TaskAssignedPayload;
-      addActivity(task.id, { kind: "phase", role: "execute", title: task.review ? `Executor fixing review findings (round ${task.reviewRounds ?? 1})` : "Executor started" });
+      const round = task.reviewRounds ?? 1;
+      const reason = REWORK[task.conflicts?.length ? "conflicts" : (task.rework ?? "review")];
+      addActivity(task.id, { kind: "phase", role: "execute", title: task.review ? `${reason.phase} (round ${round})` : "Executor started" });
       const session = await sessionFor(task);
       if (!session) return;
-      const rework = task.review
-        ? `\n\n## Code review findings to fix (round ${task.reviewRounds ?? 1})\n\n${task.review}\n\n## Your previous summary\n\n${task.result ?? ""}`
-        : "";
+      const rework = task.review ? `\n\n## ${reason.heading} (round ${round})\n\n${task.review}\n\n## Your previous summary\n\n${task.result ?? ""}` : "";
       const { run, sandbox } = await startRun(task, "execute", session.sandbox);
       startLoop(agent, task.id, "execute", run, taskBrief(task) + networkNote(session.domains) + rework, {
         tools: [...agent.getTools(), ...createCodingTools(session.dir, sandbox)],
@@ -276,7 +286,8 @@ async function advanceTask({ taskId, role, run }: Session, text: string) {
     addActivity(taskId, { kind: "message", role, title: text });
     const task = await updateTask(taskId, { status: "in_review", result: text, error: undefined });
     if (!task) return endSession(taskId);
-    return emit<ReviewRequestedPayload>("task.review_requested", { task });
+    if (await mergeMain(task)) emit<ReviewRequestedPayload>("task.review_requested", { task });
+    return;
   }
 
   if (!review) {
@@ -285,21 +296,151 @@ async function advanceTask({ taskId, role, run }: Session, text: string) {
     return updateTask(taskId, { status: "failed", error: `Reviewer returned an invalid review: ${text.slice(0, 500)}` });
   }
   addActivity(taskId, { kind: "message", role, title: formatReview(review) });
-  if (review.verdict === "approve") {
-    addActivity(taskId, { kind: "phase", role, title: "Approved, ready for your review" });
-    endSession(taskId);
-    return updateTask(taskId, { status: "done", review: formatReview(review) });
-  }
+  if (review.verdict === "request_changes") return requestRework(taskId, formatReview(review), "review");
+  // main may have moved on during the review, so only call it done once it still merges cleanly.
+  const task = await updateTask(taskId, { review: formatReview(review) });
+  if (!task || !(await mergeMain(task))) return;
+  addActivity(taskId, { kind: "phase", role, title: "Approved, ready for your review" });
+  endSession(taskId);
+  return updateTask(taskId, { status: "done" });
+}
 
-  const current = await updateTask(taskId, { review: formatReview(review) });
+/** Sends the task back to the executor with review findings or merge conflicts; fails after MAX_REVIEW_ROUNDS. */
+async function requestRework(taskId: string, findings: string, rework: Rework, patch: Partial<Task> = {}) {
+  const current = await updateTask(taskId, { review: findings, rework, ...patch });
   const rounds = (current?.reviewRounds ?? 0) + 1;
   if (!current || rounds > MAX_REVIEW_ROUNDS) {
-    addActivity(taskId, { kind: "error", role, title: `Review still requests changes after ${MAX_REVIEW_ROUNDS} fix rounds` });
+    const error = current?.conflicts?.length
+      ? `Merge conflicts with main still unresolved after ${MAX_REVIEW_ROUNDS} fix rounds`
+      : `Review still requests changes after ${MAX_REVIEW_ROUNDS} fix rounds`;
+    addActivity(taskId, { kind: "error", role: "review", title: error });
     endSession(taskId);
-    return current && updateTask(taskId, { status: "failed", error: `Review still requests changes after ${MAX_REVIEW_ROUNDS} fix rounds` });
+    return current && updateTask(taskId, { status: "failed", error });
   }
   const task = await updateTask(taskId, { status: "in_progress", reviewRounds: rounds });
   if (task) emit<TaskAssignedPayload>("task.assigned", { task });
+}
+
+const conflictFindings = (files: string[]) =>
+  [
+    "`main` changed since this task started, and merging it into the task branch conflicts in:",
+    ...files.map((f) => `- ${f}`),
+    "",
+    "Each file has git conflict markers: `<<<<<<< HEAD` (this task's version), `=======`, `>>>>>>> main` (main's version).",
+    "Edit them so the result keeps main's changes and this task's intent, remove every marker, and re-run lint/typecheck.",
+    "If package.json or package-lock.json changed, run `npm install` first.",
+  ].join("\n");
+
+/**
+ * Merges main into the task branch. Clean: returns true. Conflicts go back to the executor like review findings;
+ * other git errors fail the task.
+ */
+async function mergeMain(task: Task) {
+  const step = addActivity(task.id, { kind: "setup", title: "Merging main into the task branch", status: "running" });
+  try {
+    const conflicts = await syncWithMain(task, task.conflicts);
+    if (!conflicts.length) {
+      updateActivity(task.id, step, { status: "done", title: task.conflicts?.length ? "Merge conflicts resolved, up to date with main" : "Up to date with main" });
+      if (task.conflicts) await updateTask(task.id, { conflicts: undefined });
+      return true;
+    }
+    updateActivity(task.id, step, { status: "error", title: `Merge conflicts with main in ${conflicts.length} file(s)`, detail: conflicts.join("\n") });
+    await requestRework(task.id, conflictFindings(conflicts), "conflicts", { conflicts });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    updateActivity(task.id, step, { status: "error", detail: message });
+    endSession(task.id);
+    await updateTask(task.id, { status: "failed", error: message });
+  }
+  return false;
+}
+
+/** A done task whose merge into main conflicts goes back to the executor with a fresh round budget. */
+export async function resolveMergeConflicts(task: Task, conflicts: string[]) {
+  addActivity(task.id, { kind: "error", role: "review", title: `Main changed: merge conflicts in ${conflicts.length} file(s)`, detail: conflicts.join("\n") });
+  await updateTask(task.id, { reviewRounds: 0 });
+  await requestRework(task.id, conflictFindings(conflicts), "conflicts", { conflicts });
+}
+
+// Lint and typecheck always work offline; `next build` may need fonts.googleapis.com.
+const MAIN_CHECKS = [
+  { step: "running lint", command: "npm run lint --if-present" },
+  { step: "running typecheck", command: "[ ! -f tsconfig.json ] || npx tsc --noEmit" },
+];
+const DEPENDENCY_FILES = new Set(["package.json", "package-lock.json"]);
+
+/**
+ * Like CI on a PR whose base moved: merges main into a done task and re-runs lint and typecheck on the result. Conflicts
+ * or failing checks send it back through execution and review; if the checks can't run at all it stays done.
+ */
+async function recheckDoneTask(task: Task) {
+  const label = (step: string) => setTaskCheck(task.id, `Checking against main: ${step}`);
+  label("merging main");
+  const phase = addActivity(task.id, { kind: "setup", title: "Main changed: merging it into this task", status: "running" });
+  const before = await headRevision(task);
+  const conflicts = await syncWithMain(task, task.conflicts);
+  if (conflicts.length) {
+    updateActivity(task.id, phase, { status: "error" });
+    return resolveMergeConflicts(task, conflicts);
+  }
+  const changed = await changedSince(task, before);
+  updateActivity(task.id, phase, { status: "done", title: changed.length ? `Merged main (${changed.length} file(s) changed)` : "Already up to date with main", detail: changed.join("\n") || undefined });
+  if (!changed.length) return;
+
+  const deps = changed.some((file) => DEPENDENCY_FILES.has(file));
+  const session = `check-${task.id}`;
+  const networkArgs = deps
+    ? await openEgress(session, (await getProject(task.projectId))?.allowedDomains ?? []).catch((e) => console.error(`[agent] egress proxy unavailable for ${session}`, e))
+    : undefined;
+  const sandbox = new DockerSandbox(session, worktreeDir(task), { nodeModulesKey: taskKey(task), networkArgs: networkArgs ?? undefined });
+  try {
+    const steps = [...(deps ? [{ step: "installing dependencies", command: "npm install --no-audit --no-fund" }] : []), ...MAIN_CHECKS];
+    const failures: string[] = [];
+    for (const { step, command } of steps) {
+      label(step);
+      const id = addActivity(task.id, { kind: "tool", tool: "run_command", title: `$ ${command}`, status: "running" });
+      const result = await sandbox.exec(command);
+      const { detail } = describeToolResult("run_command", JSON.stringify(result));
+      updateActivity(task.id, id, { status: result.ok ? "done" : "error", detail });
+      if (result.ok) continue;
+      // No exit code or a timeout means the check itself couldn't run, which says nothing about the code.
+      if (result.exitCode === null || result.timedOut) {
+        addActivity(task.id, { kind: "error", title: `Couldn't run checks against main (${step}); left in Done`, detail });
+        return;
+      }
+      failures.push(`### \`${command}\` failed\n\n\`\`\`\n${(detail ?? "").slice(-3000)}\n\`\`\``);
+      if (step === "installing dependencies") break;
+    }
+    if (!failures.length) {
+      addActivity(task.id, { kind: "phase", title: "Checks pass on the latest main" });
+      return;
+    }
+    addActivity(task.id, { kind: "error", role: "review", title: "Checks fail after merging the latest main" });
+    await updateTask(task.id, { reviewRounds: 0 });
+    const findings = `The latest main was merged into this task branch without conflicts, but these checks now fail:\n\n${failures.join("\n\n")}\n\nFix them while keeping both main's changes and this task's intent.`;
+    await requestRework(task.id, findings, "checks");
+  } finally {
+    await sandbox.dispose();
+    if (networkArgs) await closeEgress(session);
+  }
+}
+
+/**
+ * Main moved (a task was merged): keeps every other done task mergeable and green, one at a time because the worktrees
+ * share one repository and node_modules volumes.
+ */
+export async function syncDoneTasks(projectId: string) {
+  for (const task of await listTasks(projectId)) {
+    if (task.status !== "done" || task.checking || !task.branch || task.mergedCommit || !hasWorktree(task)) continue;
+    try {
+      await recheckDoneTask(task);
+    } catch (error) {
+      console.error(`[agent] failed to re-check task ${task.id} against main`, error);
+      addActivity(task.id, { kind: "error", title: "Re-checking against main failed", detail: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setTaskCheck(task.id);
+    }
+  }
 }
 
 type ActivityItem = { type: string; name?: string; content?: { text?: string }; summary?: { text: string }[] };
