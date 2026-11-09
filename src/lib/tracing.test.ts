@@ -1,6 +1,10 @@
+import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createAgentModels } from "./agent-models";
 import { AgentRun, parseRemote } from "./tracing";
 
 type OtlpValue = { stringValue?: string; intValue?: string | number; boolValue?: boolean };
@@ -95,5 +99,28 @@ describe("AgentRun", () => {
     expect(byOp.chat.parentSpanId).toBe(root.spanId);
     expect(attrs(byOp.execute_tool.attributes)).toMatchObject({ "gen_ai.tool.name": "docker_exec", "gen_ai.tool.type": "function", "gen_ai.tool.call.id": "call_1" });
     expect(byOp.execute_tool.status?.code).toBe(2);
+  });
+
+  it("reports each agent's configured model and provider on its own session", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "tracing-models-"));
+    const models = createAgentModels(path.join(dir, "agent-models.json"));
+    await models.save({ implement: { provider: "anthropic", model: "claude-opus-5-5" }, review: { provider: "google", model: "gemini-3.1-pro-preview" } });
+    requests.length = 0;
+    for (const agentName of ["implement", "review"] as const) {
+      const { model, provider } = await models.resolve(agentName);
+      const run = await AgentRun.start({ agentName, model, provider, vcs: { branch: "task/abcd1234" } });
+      await run.modelTurn(async () => ({ tokenUsage: { inputTokens: 1, outputTokens: 1 } }));
+      await run.end();
+    }
+    await rm(dir, { recursive: true, force: true });
+
+    const sessions = requests.map(({ body }) => {
+      const spans: OtlpSpan[] = JSON.parse(body).resourceSpans[0].scopeSpans[0].spans;
+      return Object.fromEntries(spans.map((s) => [attrs(s.attributes)["gen_ai.operation.name"], { name: s.name, ...attrs(s.attributes) }]));
+    });
+    expect(sessions).toHaveLength(2);
+    expect(sessions[0].chat).toMatchObject({ name: "chat claude-opus-5-5", "gen_ai.agent.name": "implement", "gen_ai.provider.name": "anthropic", "gen_ai.request.model": "claude-opus-5-5" });
+    expect(sessions[0].invoke_agent).toMatchObject({ "gen_ai.provider.name": "anthropic", "gen_ai.request.model": "claude-opus-5-5" });
+    expect(sessions[1].chat).toMatchObject({ name: "chat gemini-3.1-pro-preview", "gen_ai.agent.name": "review", "gen_ai.provider.name": "google", "gen_ai.request.model": "gemini-3.1-pro-preview" });
   });
 });

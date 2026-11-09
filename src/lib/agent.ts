@@ -8,7 +8,6 @@ import {
   RuntimeState,
   SemanticEvent,
   SituationSpecification,
-  supportedModels,
   type Agent,
   type InferenceInput,
   type InferenceRunner,
@@ -19,19 +18,20 @@ import {
 import { createCloudExporter } from "@mozaik-ai/cloud-sdk/exporter";
 import type { ActivityRole } from "./activity";
 import { addActivity, updateActivity } from "./activity-log";
+import { agentModels, type ResolvedModel } from "./agent-models";
 import { createCodingTools } from "./coding-tools";
 import { DockerSandbox } from "./docker-sandbox";
 import { closeEgress, openEgress } from "./egress";
 import { getProject } from "./project-store";
+import type { ModelAgentName } from "./factory-agents";
+import { modelRegistry } from "./models";
 import { DEFAULT_ALLOWED_DOMAINS } from "./projects";
 import { setTaskCheck } from "./task-checks";
 import { listTasks, updateTask } from "./task-store";
 import type { Task } from "./tasks";
-import { AgentRun, type AgentName } from "./tracing";
+import { AgentRun } from "./tracing";
 import { changedSince, ensureWorktree, hasWorktree, headRevision, syncWithMain, taskKey, taskVcs, worktreeDir } from "./workspace";
 
-const MODEL = process.env.MOZAIK_MODEL ?? "gpt-5.5";
-const PROVIDER = supportedModels.find((m) => m.specification.name === MODEL)?.specification.provider;
 const MAX_REVIEW_ROUNDS = Number(process.env.MAX_REVIEW_ROUNDS ?? 3);
 const REVIEW_TOOLS = new Set(["list_files", "read_file", "run_command"]);
 
@@ -85,7 +85,7 @@ const REVIEW_FORMAT: StructuredOutputFormat = {
 };
 
 type Role = ActivityRole;
-type Session = { taskId: string; role: Role; contextId: string; run: AgentRun };
+type Session = { taskId: string; role: Role; contextId: string; run: AgentRun; model: ResolvedModel };
 type Review = { verdict: "approve" | "request_changes"; summary: string; findings: string[] };
 
 type TaskAssignedPayload = { task: Task };
@@ -121,8 +121,11 @@ const inferenceRunner: InferenceRunner = {
   async run(input) {
     const session = resolveRuntime().state.sessionByContext.get(input.context.id);
     try {
-      const model = supportedModels.find((m) => m.specification.name === input.model);
-      if (!model) throw new Error(`Unsupported model: ${input.model}`);
+      const model = session ? session.model.generative : modelRegistry.findByName(input.model)?.model;
+      if (!model) {
+        const name = session?.model.provider ? `${session.model.provider}/${input.model}` : input.model;
+        throw new Error(`Unsupported model: ${name}. Pick a supported one in Factory settings or MOZAIK_MODEL.`);
+      }
       return await (session ? session.run.modelTurn(() => model.endpoint.infer(input)) : model.endpoint.infer(input));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -177,23 +180,29 @@ function endSession(taskId: string) {
   void closeEgress(taskId);
 }
 
-const AGENT_NAMES: Record<Role, AgentName> = { execute: "implement", review: "review" };
+const AGENT_NAMES: Record<Role, ModelAgentName> = { execute: "implement", review: "review" };
 
-/** One traced session per agent run; run_command's sandbox calls become `docker_exec` tool spans. */
+/**
+ * One traced session per agent run, on the agent's configured model (or MOZAIK_MODEL); run_command's sandbox calls become
+ * `docker_exec` tool spans.
+ */
 async function startRun(task: Task, role: Role, sandbox: DockerSandbox) {
-  const run = await AgentRun.start({ agentName: AGENT_NAMES[role], model: MODEL, provider: PROVIDER, vcs: await taskVcs(task) });
+  const model = await agentModels.resolve(AGENT_NAMES[role]);
+  const run = await AgentRun.start({ agentName: AGENT_NAMES[role], model: model.model, provider: model.provider, vcs: await taskVcs(task) });
   const traced: Pick<DockerSandbox, "exec"> = {
     exec: (command) =>
       run.executeTool("docker_exec", () => sandbox.exec(command), (r) =>
         r.ok ? undefined : r.timedOut ? "Command timed out" : `Command failed with exit code ${r.exitCode ?? "unknown"}`),
   };
-  return { run, sandbox: traced };
+  return { run, model, sandbox: traced };
 }
 
-function startLoop(agent: Agent, taskId: string, role: Role, run: AgentRun, message: string, input: Omit<InferenceInput, "model" | "context">) {
+type Started = Awaited<ReturnType<typeof startRun>>;
+
+function startLoop(agent: Agent, taskId: string, role: Role, { run, model }: Started, message: string, input: Omit<InferenceInput, "model" | "context">) {
   const context = ModelContext.create().addContextItem(DeveloperMessageItem.create(agent.getDeveloperMessage()));
-  resolveRuntime().state.sessionByContext.set(context.id, { taskId, role, contextId: context.id, run });
-  runLoop(agent.getId(), message, { model: MODEL, context, ...input });
+  resolveRuntime().state.sessionByContext.set(context.id, { taskId, role, contextId: context.id, run, model });
+  runLoop(agent.getId(), message, { model: model.model, context, ...input });
 }
 
 type Rework = NonNullable<Task["rework"]>;
@@ -230,9 +239,9 @@ const executeAssignedTask: SituationHandler = {
       const session = await sessionFor(task);
       if (!session) return;
       const rework = task.review ? `\n\n## ${reason.heading} (round ${round})\n\n${task.review}\n\n## Your previous summary\n\n${task.result ?? ""}` : "";
-      const { run, sandbox } = await startRun(task, "execute", session.sandbox);
-      startLoop(agent, task.id, "execute", run, taskBrief(task) + networkNote(session.domains) + rework, {
-        tools: [...agent.getTools(), ...createCodingTools(session.dir, sandbox)],
+      const started = await startRun(task, "execute", session.sandbox);
+      startLoop(agent, task.id, "execute", started, taskBrief(task) + networkNote(session.domains) + rework, {
+        tools: [...agent.getTools(), ...createCodingTools(session.dir, started.sandbox)],
       });
     },
   },
@@ -248,9 +257,9 @@ const reviewImplementedTask: SituationHandler = {
       const session = await sessionFor(task);
       if (!session) return;
       const summary = task.result ? `\n\n## Implementer's summary\n\n${task.result}` : "";
-      const { run, sandbox } = await startRun(task, "review", session.sandbox);
-      startLoop(agent, task.id, "review", run, `Review the implementation of this task.\n\n${taskBrief(task)}${networkNote(session.domains)}${summary}`, {
-        tools: [...agent.getTools(), ...createCodingTools(session.dir, sandbox).filter((tool) => REVIEW_TOOLS.has(tool.name))],
+      const started = await startRun(task, "review", session.sandbox);
+      startLoop(agent, task.id, "review", started, `Review the implementation of this task.\n\n${taskBrief(task)}${networkNote(session.domains)}${summary}`, {
+        tools: [...agent.getTools(), ...createCodingTools(session.dir, started.sandbox).filter((tool) => REVIEW_TOOLS.has(tool.name))],
         structuredOutput: REVIEW_FORMAT,
       });
     },
