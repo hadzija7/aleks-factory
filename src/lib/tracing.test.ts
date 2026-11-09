@@ -77,7 +77,7 @@ describe("AgentRun", () => {
     expect(byOp.execute_tool.status?.code).toBe(2);
   });
 
-  it("traces wrapped tools under the root with the call id from setToolCallId or the endpoint, nesting docker_exec", async () => {
+  it("traces wrapped tools under the open chat span or else the root, with the call id from the endpoint or setToolCallId", async () => {
     requests.length = 0;
     const run = await AgentRun.start({ agentName: "review", model: "composer-2.5", provider: "cursor", vcs: { branch: "task/abcd1234" } });
     const runCommand = run.traceTool(tool("run_command", () => run.executeTool("docker_exec", async () => "TOOL OUTPUT", () => undefined)));
@@ -105,11 +105,11 @@ describe("AgentRun", () => {
     expect(body).not.toContain("a.ts");
     expect(spanTree(collector.sessionSpans())).toEqual([
       "chat composer-2.5",
+      "  execute_tool read_file (call_b)",
+      "  execute_tool run_command (call_a)",
+      "    execute_tool docker_exec (call_a)",
       "execute_tool edit_file (call_2) [error]",
       "execute_tool read_file (call_1)",
-      "execute_tool read_file (call_b)",
-      "execute_tool run_command (call_a)",
-      "  execute_tool docker_exec (call_a)",
     ]);
   });
 

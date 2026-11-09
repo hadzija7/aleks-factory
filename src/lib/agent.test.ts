@@ -110,15 +110,15 @@ const TOOL_SPANS = [
 ];
 
 describe("agent tool tracing", () => {
-  it("gives each tool call in Mozaik's loop one execute_tool span with its call id, docker_exec nested under run_command", async () => {
+  it("gives each tool call in Mozaik's loop one execute_tool span under the root, next to the per-turn chat spans", async () => {
     const tree = await traceOf(mozaikModel());
     expect(tree).toEqual([...Array(4).fill("chat gpt-5.5"), ...TOOL_SPANS]);
     expect(fakes.exec).toHaveBeenCalledWith("npm test");
   });
 
-  it("produces the same tool spans when Cursor runs the tool loop, one per call", async () => {
+  it("produces the same tool spans when Cursor runs the tool loop, one per call, nested under its one chat span", async () => {
     const tree = await traceOf(cursorPathModel());
-    expect(tree).toEqual(["chat composer-2.5", ...TOOL_SPANS]);
+    expect(tree).toEqual(["chat composer-2.5", ...TOOL_SPANS.map((line) => `  ${line}`)]);
     expect(fakes.exec).toHaveBeenCalledWith("npm test");
   });
 });

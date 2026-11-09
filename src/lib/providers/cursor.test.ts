@@ -189,8 +189,8 @@ describe("CursorEndpoint", () => {
     expect(spanTree(collector.sessionSpans())).toEqual([
       "chat composer-2.5",
       "chat composer-2.5",
-      "execute_tool read_file (call_a)",
-      "execute_tool read_file (call_b)",
+      "  execute_tool read_file (call_a)",
+      "  execute_tool read_file (call_b)",
     ]);
   });
 });

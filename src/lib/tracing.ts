@@ -69,6 +69,8 @@ const defined = (attributes: Attributes) => Object.fromEntries(Object.entries(at
 
 /** The tool span in flight, so spans started inside it (run_command's docker_exec) nest under it and share its call id. */
 const activeTool = new AsyncLocalStorage<{ run: AgentRun; span: Span; callId: string }>();
+/** The chat span in flight, so tools an endpoint runs inside its model turn (Cursor) nest under it. */
+const activeChat = new AsyncLocalStorage<{ run: AgentRun; span: Span }>();
 /** The call id an endpoint that runs the tool loop itself (Cursor) gave the tool call in flight. */
 const endpointCallId = new AsyncLocalStorage<string>();
 
@@ -139,11 +141,11 @@ export class AgentRun {
     return callId ? endpointCallId.run(callId, fn) : fn();
   }
 
-  /** One model turn: a `chat` span with the model and token counts. */
+  /** One model turn: a `chat` span with the model and token counts. Tools run inside it (Cursor) nest under it. */
   modelTurn<T extends { tokenUsage?: TokenUsage }>(fn: () => Promise<T>) {
     const model = this.options.model;
     const span = this.startSpan(`chat ${model ?? ""}`.trim(), SpanKind.CLIENT, { "gen_ai.operation.name": "chat", "gen_ai.request.model": model }, this.root);
-    return this.traced(span, fn, ({ tokenUsage }) => {
+    return this.traced(span, () => activeChat.run({ run: this, span }, fn), ({ tokenUsage }) => {
       if (!tokenUsage) return;
       span.setAttributes({ "gen_ai.usage.input_tokens": tokenUsage.inputTokens, "gen_ai.usage.output_tokens": tokenUsage.outputTokens });
     });
@@ -155,13 +157,15 @@ export class AgentRun {
   }
 
   /**
-   * One tool execution: an `execute_tool` span under the session root, next to the chat spans, or under the tool span it
-   * runs in (sharing its call id). Otherwise the call id is the endpoint's (`withToolCallId`), else the one from
-   * `setToolCallId`. `failure` returns an error description for results that count as failed.
+   * One tool execution: an `execute_tool` span under the tool span it runs in (sharing its call id), else under the open
+   * chat span (an endpoint like Cursor running its tool loop inside the model turn), else under the session root, next to
+   * the chat spans (Mozaik's loop runs tools between turns). Otherwise the call id is the endpoint's (`withToolCallId`),
+   * else the one from `setToolCallId`. `failure` returns an error description for results that count as failed.
    */
   executeTool<T>(name: string, fn: () => Promise<T>, failure: (result: T) => string | undefined) {
     const store = activeTool.getStore();
     const parent = store?.run === this ? store : undefined;
+    const chat = activeChat.getStore();
     let id = parent?.callId ?? endpointCallId.getStore();
     if (!id) {
       id = this.pendingToolCallId ?? randomUUID();
@@ -173,7 +177,7 @@ export class AgentRun {
       "gen_ai.tool.name": name,
       "gen_ai.tool.type": "function",
       "gen_ai.tool.call.id": callId,
-    }, parent?.span ?? this.root);
+    }, parent?.span ?? (chat?.run === this ? chat.span : this.root));
     return this.traced(span, () => activeTool.run({ run: this, span, callId }, fn), (result) => {
       const error = failure(result);
       if (error) fail(span, new Error(error));
