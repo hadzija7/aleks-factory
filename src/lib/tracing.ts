@@ -73,6 +73,8 @@ const activeTool = new AsyncLocalStorage<{ run: AgentRun; span: Span; callId: st
 const activeChat = new AsyncLocalStorage<{ run: AgentRun; span: Span }>();
 /** The call id an endpoint that runs the tool loop itself (Cursor) gave the tool call in flight. */
 const endpointCallId = new AsyncLocalStorage<string>();
+/** The non-model step in flight (workspace setup), so steps started inside it (npm ci) nest under it. */
+const activeStep = new AsyncLocalStorage<{ run: AgentRun; span: Span }>();
 
 export class AgentRun {
   readonly conversationId = randomUUID();
@@ -190,6 +192,18 @@ export class AgentRun {
    */
   traceTool(tool: Tool): Tool {
     return { ...tool, invoke: (args) => this.executeTool(tool.name, () => tool.invoke(args), () => undefined) };
+  }
+
+  /** A non-model, non-tool step (e.g. workspace setup) as an internal span; steps started inside it nest under it. */
+  step<T>(name: string, fn: () => Promise<T>) {
+    const store = activeStep.getStore();
+    const span = this.startSpan(name, SpanKind.INTERNAL, {}, store?.run === this ? store.span : this.root);
+    return this.traced(span, () => activeStep.run({ run: this, span }, fn), () => {});
+  }
+
+  /** Runs `fn` as a step of the step in flight (e.g. `npm ci` inside workspace setup), or untraced outside one. */
+  static step<T>(name: string, fn: () => Promise<T>) {
+    return activeStep.getStore()?.run.step(name, fn) ?? fn();
   }
 
   /** Adds attributes learned during the run (e.g. the merge commit) to the session's root span. */

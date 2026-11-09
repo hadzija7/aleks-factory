@@ -5,6 +5,7 @@ import { parseDiff } from "./diff";
 import { DATA_DIR, errorMessage, execFileAsync, nodeModulesVolume, removeVolume, runSetupCommand } from "./docker";
 import type { DiffFile, LocalEnvFile, Project } from "./projects";
 import type { Task } from "./tasks";
+import { AgentRun } from "./tracing";
 
 const CREATE_NEXT_APP = "create-next-app@16.4.2";
 
@@ -129,7 +130,7 @@ export async function ensureWorktree(task: Task) {
   if (!existsSync(worktreeGitDir(task))) throw new Error(`Unexpected worktree admin dir for ${branch}`);
   await syncEnvFiles(repo, await localEnvFiles(repo, (args) => git(repo, args)), dir);
   if (existsSync(path.join(dir, "package-lock.json"))) {
-    const install = await runSetupCommand(dir, "npm ci --no-audit --no-fund", taskKey(task));
+    const install = await AgentRun.step("npm ci", () => runSetupCommand(dir, "npm ci --no-audit --no-fund", taskKey(task)));
     if (!install.ok) throw new Error(`npm ci failed:\n${install.output}`);
   }
   return { dir, branch };
@@ -141,7 +142,12 @@ export const hasWorktree = (task: Task) => existsSync(worktreeDir(task));
 export async function taskVcs(task: Task) {
   const optional = (run: Promise<string>) => run.then((out) => out.trim() || undefined, () => undefined);
   const [startingCommit, remoteUrl] = await Promise.all([
-    hasWorktree(task) ? optional(worktreeGit(task, ["rev-parse", "HEAD"])) : undefined,
+    // Before the worktree exists the run starts from the branch if it's left over, else from main, which it forks from.
+    hasWorktree(task)
+      ? optional(worktreeGit(task, ["rev-parse", "HEAD"]))
+      : optional(git(repoDir(task.projectId), ["rev-parse", "--verify", "--quiet", `refs/heads/${branchName(task)}`])).then(
+          (sha) => sha ?? optional(git(repoDir(task.projectId), ["rev-parse", "--verify", "main"])),
+        ),
     optional(git(repoDir(task.projectId), ["remote", "get-url", "origin"])),
   ]);
   const base = process.env.FACTORY_PUBLIC_URL?.replace(/\/+$/, "");

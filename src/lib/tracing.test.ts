@@ -29,6 +29,8 @@ describe("AgentRun", () => {
       provider: "openai",
       vcs: { branch: "task/abcd1234", startingCommit: "deadbeef", remoteUrl: "git@github.com:acme/widgets.git", issueUrl: "http://localhost:3000/projects/p?task=t" },
     });
+    await run.step("workspace_setup", () => AgentRun.step("npm ci", async () => ({ ok: true })));
+    await AgentRun.step("outside a run", async () => undefined);
     await run.modelTurn(async () => ({ tokenUsage: { inputTokens: 120, outputTokens: 30 }, secret: "PROMPT BODY" }));
     run.setToolCallId("call_1");
     await run.executeTool("docker_exec", async () => ({ ok: false, exitCode: 2, stdout: "TOOL OUTPUT" }), (r) => (r.ok ? undefined : `exit ${r.exitCode}`));
@@ -73,6 +75,10 @@ describe("AgentRun", () => {
     expect(attrs(byOp.chat.attributes)).toMatchObject({ "gen_ai.request.model": "gpt-5.5", "gen_ai.usage.input_tokens": 120, "gen_ai.usage.output_tokens": 30 });
     expect(attrs(root.attributes)["dash0.gen_ai.vcs.ref.head.merge_commit"]).toBe("cafef00d");
     expect(byOp.chat.parentSpanId).toBe(root.spanId);
+    const byName = Object.fromEntries(spans.map((s) => [s.name, s]));
+    expect(byName.workspace_setup.parentSpanId).toBe(root.spanId);
+    expect(byName["npm ci"].parentSpanId).toBe(byName.workspace_setup.spanId);
+    expect(byName["outside a run"]).toBeUndefined();
     expect(attrs(byOp.execute_tool.attributes)).toMatchObject({ "gen_ai.tool.name": "docker_exec", "gen_ai.tool.type": "function", "gen_ai.tool.call.id": "call_1" });
     expect(byOp.execute_tool.status?.code).toBe(2);
   });

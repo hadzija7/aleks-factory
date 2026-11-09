@@ -6,6 +6,9 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Task } from "./tasks";
 
+// Each test runs a few dozen real git commands, which can exceed the 5s default on a busy machine.
+vi.setConfig({ testTimeout: 30_000 });
+
 vi.mock("./docker", async (importOriginal) => ({ ...(await importOriginal<typeof import("./docker")>()), removeVolume: vi.fn() }));
 
 const root = mkdtempSync(path.join(tmpdir(), "workspace-test-"));

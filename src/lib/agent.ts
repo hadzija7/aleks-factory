@@ -183,21 +183,28 @@ function endSession(taskId: string) {
 const AGENT_NAMES: Record<Role, ModelAgentName> = { execute: "implement", review: "review" };
 
 /**
- * One traced session per agent run, on the agent's configured model (or MOZAIK_MODEL); run_command's sandbox calls become
- * `docker_exec` spans nested under its `execute_tool run_command` span.
+ * One traced session per agent run, on the agent's configured model (or MOZAIK_MODEL). Workspace setup (worktree,
+ * dependency install, sandbox) is its `workspace_setup` span and run_command's sandbox calls become `docker_exec` spans
+ * nested under its `execute_tool run_command` span. Returns undefined, with the session ended as failed, if setup fails.
  */
-async function startRun(task: Task, role: Role, sandbox: DockerSandbox) {
+async function startRun(task: Task, role: Role) {
   const model = await agentModels.resolve(AGENT_NAMES[role]);
   const run = await AgentRun.start({ agentName: AGENT_NAMES[role], model: model.model, provider: model.provider, vcs: await taskVcs(task) });
+  const session = await run.step("workspace_setup", () => sessionFor(task));
+  if (!session) {
+    await run.end("Workspace setup failed");
+    return;
+  }
+  const { sandbox } = session;
   const traced: Pick<DockerSandbox, "exec"> = {
     exec: (command) =>
       run.executeTool("docker_exec", () => sandbox.exec(command), (r) =>
         r.ok ? undefined : r.timedOut ? "Command timed out" : `Command failed with exit code ${r.exitCode ?? "unknown"}`),
   };
-  return { run, model, sandbox: traced };
+  return { run, model, session, sandbox: traced };
 }
 
-type Started = Awaited<ReturnType<typeof startRun>>;
+type Started = NonNullable<Awaited<ReturnType<typeof startRun>>>;
 
 /**
  * Tools are traced here, once, so every call is an `execute_tool` span whether Mozaik's loop or the endpoint (Cursor)
@@ -240,10 +247,10 @@ const executeAssignedTask: SituationHandler = {
       const round = task.reviewRounds ?? 1;
       const reason = REWORK[task.conflicts?.length ? "conflicts" : (task.rework ?? "review")];
       addActivity(task.id, { kind: "phase", role: "execute", title: task.review ? `${reason.phase} (round ${round})` : "Executor started" });
-      const session = await sessionFor(task);
-      if (!session) return;
+      const started = await startRun(task, "execute");
+      if (!started) return;
+      const { session } = started;
       const rework = task.review ? `\n\n## ${reason.heading} (round ${round})\n\n${task.review}\n\n## Your previous summary\n\n${task.result ?? ""}` : "";
-      const started = await startRun(task, "execute", session.sandbox);
       startLoop(agent, task.id, "execute", started, taskBrief(task) + networkNote(session.domains) + rework, {
         tools: [...agent.getTools(), ...createCodingTools(session.dir, started.sandbox)],
       });
@@ -258,10 +265,10 @@ const reviewImplementedTask: SituationHandler = {
       const agent = participant as Agent;
       const { task } = event.payload as ReviewRequestedPayload;
       addActivity(task.id, { kind: "phase", role: "review", title: "Code review started" });
-      const session = await sessionFor(task);
-      if (!session) return;
+      const started = await startRun(task, "review");
+      if (!started) return;
+      const { session } = started;
       const summary = task.result ? `\n\n## Implementer's summary\n\n${task.result}` : "";
-      const started = await startRun(task, "review", session.sandbox);
       startLoop(agent, task.id, "review", started, `Review the implementation of this task.\n\n${taskBrief(task)}${networkNote(session.domains)}${summary}`, {
         tools: [...agent.getTools(), ...createCodingTools(session.dir, started.sandbox).filter((tool) => REVIEW_TOOLS.has(tool.name))],
         structuredOutput: REVIEW_FORMAT,
