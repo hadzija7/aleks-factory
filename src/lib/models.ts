@@ -21,6 +21,8 @@ export type ModelProvider = {
   modelLabels?: Record<string, string>;
   /** Models listed without the provider confirming them (e.g. its catalog couldn't be loaded). */
   unverifiedModels?: string[];
+  /** Other names lookups accept, by the model name they resolve to (e.g. a default saved before the catalog loaded). */
+  aliases?: Record<string, string>;
 };
 
 /** A provider, or a function that lists it now, for providers whose models are discovered at runtime (cached by the provider). */
@@ -68,13 +70,17 @@ function snapshot(providers: ModelProvider[]) {
     merged.set(provider.id, { ...existing, ...provider, models: [...models.values()] });
   }
   const list = [...merged.values()];
+  const lookup = (provider: ModelProvider | undefined, model: string) => {
+    const name = provider?.aliases?.[model] ?? model;
+    return provider?.models.find((m) => m.specification.name === name);
+  };
   return {
     providers: list,
-    find: (provider: string, model: string) => merged.get(provider)?.models.find((m) => m.specification.name === model),
+    find: (provider: string, model: string) => lookup(merged.get(provider), model),
     /** The first provider offering `model`, for MOZAIK_MODEL which names a model only. */
     findByName: (model: string) => {
       for (const provider of list) {
-        const found = provider.models.find((m) => m.specification.name === model);
+        const found = lookup(provider, model);
         if (found) return { provider: provider.id, model: found };
       }
     },

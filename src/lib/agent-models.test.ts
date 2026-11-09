@@ -106,7 +106,6 @@ describe("agent models", () => {
     expect(await models.resolve("review")).toMatchObject({ provider: "cursor", model: "gpt-5.6-sol", supported: true });
 
     await expect(models.save({ implement: { provider: "cursor", model: "composer-9" } })).rejects.toThrow(/implement: unknown model cursor\/composer-9/);
-    await expect(models.save({ review: { provider: "cursor", model: "grok-4.7" } })).rejects.toThrow(/review: unknown model cursor\/grok-4.7/);
     await expect(models.save({ review: { provider: "openai", model: "grok-4-7" } })).rejects.toThrow(/unknown model openai\/grok-4-7/);
 
     catalog = { source: "catalog", models: CATALOG.filter((m) => m.id !== "gpt-5.6-sol") };
@@ -130,6 +129,14 @@ describe("agent models", () => {
     await models.save({ implement: { provider: "cursor", model: "grok-4.7" }, review: { provider: "cursor", model: "composer-2.5" } });
     expect(await models.resolve("review")).toMatchObject({ provider: "cursor", model: "composer-2.5", supported: true });
     await expect(models.save({ review: { provider: "cursor", model: "gpt-5.6-sol" } })).rejects.toThrow(/unknown model cursor\/gpt-5.6-sol/);
+
+    catalog = { source: "catalog", models: CATALOG };
+    const implement = await models.resolve("implement");
+    expect(implement).toMatchObject({ provider: "cursor", model: "grok-4.7", supported: true });
+    expect(implement.generative?.specification.name).toBe("grok-4-7");
+    process.env.MOZAIK_MODEL = "grok-4.7";
+    await models.save({ implement: null });
+    expect(await models.resolve("implement")).toMatchObject({ provider: "cursor", model: "grok-4.7", source: "env", supported: true });
   });
 
   it("reports whether a provider's credential is set without exposing it", async () => {

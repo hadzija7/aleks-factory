@@ -151,6 +151,7 @@ export async function cursorProvider(catalog = cursorCatalog): Promise<ModelProv
     models: result.models.map((m) => modelFor(selectionFor(m))),
     modelLabels: Object.fromEntries(result.models.map((m) => [m.id, m.displayName])),
     defaultModel: found?.id,
+    ...(found && found.id !== wanted && { aliases: { [wanted]: found.id } }),
     note: [
       ...(found ? [] : [`The default model ${wanted} isn't in this account's catalog.`]),
       ...(result.source === "stale" ? [`Showing the last loaded catalog; refreshing failed (${result.reason}).`] : []),
