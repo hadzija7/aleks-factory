@@ -1,8 +1,13 @@
 import type { AgentOptions, RunResult, SDKCustomTool, SDKCustomToolResult } from "@cursor/sdk";
 import { DeveloperMessageItem, ModelContext, ModelMessageItem, UserMessageItem, type InferenceInput, type Tool } from "@mozaik-ai/core";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { otlpCollector, spanTree } from "../otlp-collector.test-helper";
 import { AgentRun } from "../tracing";
 import { CursorEndpoint, cursorModel, flattenContext, SUBMIT_RESULT_TOOL } from "./cursor";
+
+const collector = otlpCollector();
+beforeAll(() => collector.start());
+afterAll(() => collector.stop());
 
 // Nothing reaches the network: every test injects `prompt` or uses this mock.
 const sdk = vi.hoisted(() => ({ prompt: vi.fn(), emptyFs: vi.fn(() => ({ kind: "empty-fs" })) }));
@@ -171,14 +176,22 @@ describe("CursorEndpoint", () => {
     expect(answerText(output)).toBe("hi");
   });
 
-  it("traces each custom tool call on the run whose model turn is in flight, with its own call id", async () => {
+  it("opens no spans itself: traced tools get one execute_tool span per call, with Cursor's call id", async () => {
+    collector.requests.length = 0;
     const run = await AgentRun.start({ agentName: "implement", model: "composer-2.5", provider: "cursor", vcs: { branch: "task/x" } });
-    const executeTool = vi.spyOn(run, "executeTool");
+    const untraced = readFile();
     const prompt = fakePrompt([[["read_file", { path: "a.ts" }, "call_a"], ["read_file", { path: "b.ts" }, "call_b"]]]);
-    await run.modelTurn(() => new CursorEndpoint(COMPOSER, prompt).infer(inputWith({ tools: [readFile()] })));
-    expect(executeTool.mock.calls.map(([name, , , callId]) => [name, callId])).toEqual([["read_file", "call_a"], ["read_file", "call_b"]]);
-    expect(AgentRun.current()).toBeUndefined();
+    await run.modelTurn(() => new CursorEndpoint(COMPOSER, prompt).infer(inputWith({ tools: [untraced] })));
+    await run.modelTurn(() => new CursorEndpoint(COMPOSER, prompt).infer(inputWith({ tools: [run.traceTool(readFile())] })));
     await run.end();
+
+    expect(untraced.invoke).toHaveBeenCalledTimes(2);
+    expect(spanTree(collector.sessionSpans())).toEqual([
+      "chat composer-2.5",
+      "chat composer-2.5",
+      "execute_tool read_file (call_a)",
+      "execute_tool read_file (call_b)",
+    ]);
   });
 });
 
