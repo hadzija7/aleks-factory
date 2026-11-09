@@ -118,7 +118,11 @@ export function FactorySettings() {
                     return (
                       <option key={m.name} value={m.name} disabled={missing.length > 0}>
                         {m.name}
-                        {missing.length ? ` (no ${missing.map((c) => CAPABILITY_LABELS[c]).join(", ")})` : ` · ${Math.round(m.contextWindowSize / 1000)}k context`}
+                        {missing.length
+                          ? ` (no ${missing.map((c) => CAPABILITY_LABELS[c]).join(", ")})`
+                          : m.contextWindowSize
+                            ? ` · ${Math.round(m.contextWindowSize / 1000)}k context`
+                            : ""}
                       </option>
                     );
                   })}

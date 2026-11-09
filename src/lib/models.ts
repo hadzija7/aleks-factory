@@ -1,5 +1,6 @@
 import { supportedModels } from "@mozaik-ai/core";
 import type { ModelCapability, ModelInfo, ProviderInfo } from "./factory-agents";
+import { composerModel, CURSOR_CREDENTIAL_ENV } from "./providers/cursor";
 
 /** Mozaik's `{ endpoint, specification }` model type, which its package doesn't export by name. */
 export type GenerativeModel = (typeof supportedModels)[number];
@@ -30,7 +31,15 @@ const MOZAIK_PROVIDERS: Record<string, ProviderMeta> = {
 };
 
 /** Providers whose endpoints live in the factory rather than in Mozaik. */
-const FACTORY_PROVIDERS: ModelProvider[] = [];
+export const FACTORY_PROVIDERS: ModelProvider[] = [
+  {
+    id: "cursor",
+    label: "Cursor",
+    credentialEnv: CURSOR_CREDENTIAL_ENV,
+    note: "Composer via the Cursor SDK. Cursor runs the tool loop itself, so tool calls show up in Dash0 traces but not in the task activity feed.",
+    models: [composerModel],
+  },
+];
 
 function mozaikProviders(): ModelProvider[] {
   const byId = new Map<string, ModelProvider>();
@@ -76,7 +85,11 @@ export function createModelRegistry(providers: ModelProvider[]) {
         credentialEnv,
         credentialSet: Boolean(process.env[credentialEnv]?.trim()),
         ...(note && { note }),
-        models: models.map((m): ModelInfo => ({ name: m.specification.name, contextWindowSize: m.specification.contextWindowSize, capabilities: capabilities(m) })),
+        models: models.map((m): ModelInfo => ({
+          name: m.specification.name,
+          ...(m.specification.contextWindowSize > 0 && { contextWindowSize: m.specification.contextWindowSize }),
+          capabilities: capabilities(m),
+        })),
       })),
   };
 }

@@ -4,16 +4,18 @@ import path from "node:path";
 import { supportedModels } from "@mozaik-ai/core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAgentModels } from "./agent-models";
-import { createModelRegistry, modelRegistry, type GenerativeModel } from "./models";
+import { createModelRegistry, FACTORY_PROVIDERS, modelRegistry, type GenerativeModel } from "./models";
+import { composerModel } from "./providers/cursor";
 
 let dir: string;
 let file: string;
-const env = { MOZAIK_MODEL: process.env.MOZAIK_MODEL, OPENAI_API_KEY: process.env.OPENAI_API_KEY };
+const env = { MOZAIK_MODEL: process.env.MOZAIK_MODEL, OPENAI_API_KEY: process.env.OPENAI_API_KEY, CURSOR_API_KEY: process.env.CURSOR_API_KEY };
 
 beforeEach(async () => {
   dir = await mkdtemp(path.join(tmpdir(), "agent-models-"));
   file = path.join(dir, "agent-models.json");
   delete process.env.MOZAIK_MODEL;
+  delete process.env.CURSOR_API_KEY;
 });
 
 afterEach(async () => {
@@ -66,6 +68,33 @@ describe("agent models", () => {
     expect(await createAgentModels(file).resolve("implement")).toMatchObject({ provider: "acme", model: "custom-1", source: "settings", supported: false });
   });
 
+  it("accepts Cursor's Composer for both agents and rejects unknown Cursor models", async () => {
+    const models = createAgentModels(file);
+    await models.save({ implement: { provider: "cursor", model: "composer-2.5" }, review: { provider: "cursor", model: "composer-2.5" } });
+    for (const agent of ["implement", "review"] as const) {
+      const resolved = await models.resolve(agent);
+      expect(resolved).toMatchObject({ provider: "cursor", model: "composer-2.5", source: "settings", supported: true });
+      expect(resolved.generative).toBe(composerModel);
+    }
+    await expect(models.save({ implement: { provider: "cursor", model: "composer-9" } })).rejects.toThrow(/implement: unknown model cursor\/composer-9/);
+    await expect(models.save({ review: { provider: "cursor", model: "gpt-5.5" } })).rejects.toThrow(/review: unknown model cursor\/gpt-5.5/);
+    await expect(models.save({ review: { provider: "openai", model: "composer-2.5" } })).rejects.toThrow(/unknown model openai\/composer-2.5/);
+    expect(await models.resolve("implement")).toMatchObject({ provider: "cursor", model: "composer-2.5" });
+    process.env.MOZAIK_MODEL = "composer-2.5";
+    await models.save({ implement: null });
+    expect(await models.resolve("implement")).toMatchObject({ provider: "cursor", model: "composer-2.5", source: "env", supported: true });
+  });
+
+  it("reports whether CURSOR_API_KEY is set for the Cursor provider without exposing it", async () => {
+    expect((await createAgentModels(file).view()).providers.find((p) => p.id === "cursor")).toMatchObject({ label: "Cursor", credentialEnv: "CURSOR_API_KEY", credentialSet: false });
+    process.env.CURSOR_API_KEY = "cursor-test-do-not-leak";
+    const view = await createAgentModels(file).view();
+    expect(JSON.stringify(view)).not.toContain("cursor-test-do-not-leak");
+    const cursor = view.providers.find((p) => p.id === "cursor");
+    expect(cursor).toMatchObject({ credentialSet: true, models: [{ name: "composer-2.5", capabilities: ["functionCalling", "structuredOutput"] }] });
+    expect(cursor?.models[0]).not.toHaveProperty("contextWindowSize");
+  });
+
   it("reports whether a provider's credential is set without exposing it", async () => {
     process.env.OPENAI_API_KEY = "sk-test-do-not-leak";
     const view = await createAgentModels(file).view();
@@ -77,8 +106,19 @@ describe("agent models", () => {
 });
 
 describe("model registry", () => {
+  it("includes the Cursor provider with Composer", () => {
+    expect(FACTORY_PROVIDERS.map((p) => p.id)).toEqual(["cursor"]);
+    const cursor = modelRegistry.providers.find((p) => p.id === "cursor");
+    expect(cursor).toMatchObject({ label: "Cursor", credentialEnv: "CURSOR_API_KEY" });
+    expect(cursor?.models.map((m) => m.specification.name)).toEqual(["composer-2.5"]);
+    expect(modelRegistry.find("cursor", "composer-2.5")).toBe(composerModel);
+    expect(modelRegistry.find("cursor", "composer-2")).toBeUndefined();
+    expect(modelRegistry.findByName("composer-2.5")).toEqual({ provider: "cursor", model: composerModel });
+    expect(composerModel.specification).toMatchObject({ provider: "cursor", supportsFunctionCalling: true, supportsStructuredOutput: true });
+  });
+
   it("lists Mozaik's providers and lets factory providers add or replace models", () => {
-    expect(modelRegistry.providers.map((p) => p.id)).toEqual(expect.arrayContaining(["openai", "anthropic", "google", "deepseek"]));
+    expect(modelRegistry.providers.map((p) => p.id)).toEqual(expect.arrayContaining(["openai", "anthropic", "google", "deepseek", "cursor"]));
     const base = modelRegistry.providers;
     const composer: GenerativeModel = { ...supportedModels[0], specification: { ...supportedModels[0].specification, name: "composer-2.5", provider: "cursor" } };
     const gpt = modelRegistry.find("openai", "gpt-5.5")!;

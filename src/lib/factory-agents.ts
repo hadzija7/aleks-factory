@@ -36,7 +36,8 @@ export const isModelAgent = (value: unknown): value is ModelAgentName => MODEL_A
 
 export type ModelChoice = { provider: string; model: string };
 
-export type ModelInfo = { name: string; contextWindowSize: number; capabilities: ModelCapability[] };
+/** `contextWindowSize` is absent when the provider doesn't publish it. */
+export type ModelInfo = { name: string; contextWindowSize?: number; capabilities: ModelCapability[] };
 
 export type ProviderInfo = {
   id: string;
