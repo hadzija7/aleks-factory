@@ -4,7 +4,7 @@ import path from "node:path";
 import type { Tool } from "@mozaik-ai/core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createAgentModels } from "./agent-models";
-import { attrs, otlpCollector, spanTree, type OtlpSpan } from "./otlp-collector.test-helper";
+import { attrs, otlpCollector, spanTree, toolSpanViolations, type OtlpSpan } from "./otlp-collector.test-helper";
 import { AgentRun, parseRemote } from "./tracing";
 
 const collector = otlpCollector();
@@ -83,40 +83,70 @@ describe("AgentRun", () => {
     expect(byOp.execute_tool.status?.code).toBe(2);
   });
 
-  it("traces wrapped tools under the open chat span or else the root, with the call id from the endpoint or setToolCallId", async () => {
+  it("nests each tool span under the chat turn that requested it, ended (Mozaik) or open (Cursor)", async () => {
     requests.length = 0;
     const run = await AgentRun.start({ agentName: "review", model: "composer-2.5", provider: "cursor", vcs: { branch: "task/abcd1234" } });
     const runCommand = run.traceTool(tool("run_command", () => run.executeTool("docker_exec", async () => "TOOL OUTPUT", () => undefined)));
     const readFile = run.traceTool(tool("read_file", async () => "FILE CONTENTS"));
     const failing = run.traceTool(tool("edit_file", async () => Promise.reject(new Error("old text not found"))));
+    const turn = (fn: () => Promise<unknown> = async () => {}) => run.modelTurn(async () => ({ tokenUsage: { inputTokens: 1, outputTokens: 1 }, done: await fn() }));
 
-    // Mozaik's loop: one call at a time, the id announced right before it runs.
+    // Mozaik's loop: a turn requests a call, which is announced and runs after the turn's span ended.
+    await turn();
     run.setToolCallId("call_1");
-    await readFile.invoke({ path: "a.ts" });
+    await runCommand.invoke({ command: "ls" });
+    await turn();
     run.setToolCallId("call_2");
     await expect(failing.invoke({})).rejects.toThrow("old text not found");
-    // An endpoint running the loop inside a model turn (Cursor): parallel calls, each with its own id.
-    await run.modelTurn(async () => {
-      await Promise.all([
+    // Calls are keyed to the turn that requested them, even if they run after a later turn started.
+    await turn();
+    run.setToolCallId("call_3");
+    run.setToolCallId("call_4");
+    await turn();
+    await AgentRun.withToolCallId("call_3", () => readFile.invoke({ path: "c.ts" }));
+    await AgentRun.withToolCallId("call_4", () => readFile.invoke({ path: "d.ts" }));
+    // An endpoint running the loop inside its model turn (Cursor): parallel calls, each with its own id.
+    await turn(() =>
+      Promise.all([
         AgentRun.withToolCallId("call_a", () => runCommand.invoke({ command: "ls" })),
         AgentRun.withToolCallId("call_b", () => readFile.invoke({ path: "b.ts" })),
-      ]);
-      return { tokenUsage: { inputTokens: 5, outputTokens: 2 } };
-    });
+      ]),
+    );
     await run.end();
 
     const body = requests.map((r) => r.body).join("");
     expect(body).not.toContain("TOOL OUTPUT");
     expect(body).not.toContain("FILE CONTENTS");
-    expect(body).not.toContain("a.ts");
-    expect(spanTree(collector.sessionSpans())).toEqual([
+    expect(body).not.toContain("c.ts");
+    const spans = collector.sessionSpans();
+    expect(toolSpanViolations(spans)).toEqual([]);
+    // Chat spans are exported in the order the turns ended, and the sort keeps that order for equal labels.
+    expect(spanTree(spans)).toEqual([
+      "chat composer-2.5",
+      "  execute_tool run_command (call_1)",
+      "    execute_tool docker_exec (call_1)",
+      "chat composer-2.5",
+      "  execute_tool edit_file (call_2) [error]",
+      "chat composer-2.5",
+      "  execute_tool read_file (call_3)",
+      "  execute_tool read_file (call_4)",
+      "chat composer-2.5",
       "chat composer-2.5",
       "  execute_tool read_file (call_b)",
       "  execute_tool run_command (call_a)",
       "    execute_tool docker_exec (call_a)",
-      "execute_tool edit_file (call_2) [error]",
-      "execute_tool read_file (call_1)",
     ]);
+  });
+
+  it("puts a tool span at the root only when the session had no chat turn", async () => {
+    requests.length = 0;
+    const run = await AgentRun.start({ agentName: "implement", vcs: { branch: "task/abcd1234" } });
+    run.setToolCallId("call_1");
+    await run.traceTool(tool("read_file", async () => "")).invoke({ path: "a.ts" });
+    await run.end();
+    const spans = collector.sessionSpans();
+    expect(toolSpanViolations(spans)).toEqual([]);
+    expect(spanTree(spans)).toEqual(["execute_tool read_file (call_1)"]);
   });
 
   it("reports each agent's configured model and provider on its own session", async () => {

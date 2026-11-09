@@ -1,7 +1,7 @@
 import type { AgentOptions, RunResult, SDKCustomTool, SDKCustomToolResult } from "@cursor/sdk";
 import { DeveloperMessageItem, ModelContext, ModelMessageItem, UserMessageItem, type InferenceInput, type Tool } from "@mozaik-ai/core";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { otlpCollector, spanTree } from "../otlp-collector.test-helper";
+import { otlpCollector, spanTree, toolSpanViolations } from "../otlp-collector.test-helper";
 import { AgentRun } from "../tracing";
 import { CursorEndpoint, cursorModel, flattenContext, SUBMIT_RESULT_TOOL } from "./cursor";
 
@@ -180,13 +180,15 @@ describe("CursorEndpoint", () => {
     collector.requests.length = 0;
     const run = await AgentRun.start({ agentName: "implement", model: "composer-2.5", provider: "cursor", vcs: { branch: "task/x" } });
     const untraced = readFile();
-    const prompt = fakePrompt([[["read_file", { path: "a.ts" }, "call_a"], ["read_file", { path: "b.ts" }, "call_b"]]]);
+    const prompt = fakePrompt([[["read_file", { path: "a.ts" }, "call_a\nfc_a_1"], ["read_file", { path: "b.ts" }, "call_b"]]]);
     await run.modelTurn(() => new CursorEndpoint(COMPOSER, prompt).infer(inputWith({ tools: [untraced] })));
     await run.modelTurn(() => new CursorEndpoint(COMPOSER, prompt).infer(inputWith({ tools: [run.traceTool(readFile())] })));
     await run.end();
 
     expect(untraced.invoke).toHaveBeenCalledTimes(2);
-    expect(spanTree(collector.sessionSpans())).toEqual([
+    const spans = collector.sessionSpans();
+    expect(toolSpanViolations(spans)).toEqual([]);
+    expect(spanTree(spans)).toEqual([
       "chat composer-2.5",
       "chat composer-2.5",
       "  execute_tool read_file (call_a)",

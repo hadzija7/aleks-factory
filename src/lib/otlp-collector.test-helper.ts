@@ -44,6 +44,31 @@ export function otlpCollector() {
 }
 
 /**
+ * Violations of the tool span invariants, empty when they hold: every `execute_tool` span (docker_exec included) is
+ * exported once and has exactly one parent that was exported too; none sits at the root while the session has chat turns;
+ * only a nested span (docker_exec under run_command) shares its parent's call id.
+ */
+export function toolSpanViolations(spans: OtlpSpan[]) {
+  const violations: string[] = [];
+  const byId = new Map(spans.map((s) => [s.spanId, s]));
+  const root = spans.find((s) => !s.parentSpanId);
+  const hasChat = spans.some((s) => s.name.startsWith("chat"));
+  const tools = spans.filter((s) => s.name.startsWith("execute_tool "));
+  const topLevelIds = new Map<unknown, number>();
+  for (const span of tools) {
+    const label = `${span.name} (${callIdOf(span)})`;
+    if (spans.filter((s) => s.spanId === span.spanId).length !== 1) violations.push(`${label} exported more than once`);
+    const parent = span.parentSpanId ? byId.get(span.parentSpanId) : undefined;
+    if (!parent) violations.push(`${label} has no exported parent`);
+    else if (parent === root && hasChat) violations.push(`${label} is at the root although the session has chat turns`);
+    if (!parent?.name.startsWith("execute_tool ")) topLevelIds.set(callIdOf(span), (topLevelIds.get(callIdOf(span)) ?? 0) + 1);
+    else if (callIdOf(parent) !== callIdOf(span)) violations.push(`${label} doesn't share its parent tool's call id`);
+  }
+  for (const [id, count] of topLevelIds) if (count > 1) violations.push(`call id ${id} is used by ${count} tool calls`);
+  return violations;
+}
+
+/**
  * The tree below the session root as `name (call id)` lines indented by depth, siblings sorted by that label (parallel
  * calls have no stable start order), for comparing the trees different paths produce.
  */
