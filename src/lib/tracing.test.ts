@@ -101,6 +101,43 @@ describe("AgentRun", () => {
     expect(byOp.execute_tool.status?.code).toBe(2);
   });
 
+  it("nests tools run inside a model turn under its chat span, with per-call ids even when calls run in parallel", async () => {
+    requests.length = 0;
+    const run = await AgentRun.start({ agentName: "review", model: "composer-2.5", provider: "cursor", vcs: { branch: "task/abcd1234" } });
+    run.setToolCallId("stale");
+    await run.modelTurn(async () => {
+      expect(AgentRun.current()).toBe(run);
+      await Promise.all([
+        run.executeTool("run_command", () => run.executeTool("docker_exec", async () => "TOOL OUTPUT", () => undefined), () => undefined, "call_a"),
+        run.executeTool("read_file", async () => "FILE CONTENTS", () => undefined, "call_b"),
+      ]);
+      return { tokenUsage: { inputTokens: 5, outputTokens: 2 } };
+    });
+    expect(AgentRun.current()).toBeUndefined();
+    await run.executeTool("docker_exec", async () => "", () => undefined);
+    await run.end();
+
+    const body = requests.map((r) => r.body).join("");
+    expect(body).not.toContain("TOOL OUTPUT");
+    expect(body).not.toContain("FILE CONTENTS");
+    const spans: OtlpSpan[] = JSON.parse(body).resourceSpans[0].scopeSpans[0].spans;
+    const span = (name: string, index = 0) => spans.filter((s) => s.name === name)[index];
+    const callId = (s: OtlpSpan) => attrs(s.attributes)["gen_ai.tool.call.id"];
+    const chat = span("chat composer-2.5");
+    const root = span("invoke_agent review");
+    expect(span("execute_tool run_command").parentSpanId).toBe(chat.spanId);
+    expect(span("execute_tool read_file").parentSpanId).toBe(chat.spanId);
+    expect(callId(span("execute_tool run_command"))).toBe("call_a");
+    expect(callId(span("execute_tool read_file"))).toBe("call_b");
+    const dockerExecs = spans.filter((s) => s.name === "execute_tool docker_exec");
+    const nested = dockerExecs.find((s) => s.parentSpanId === span("execute_tool run_command").spanId)!;
+    const after = dockerExecs.find((s) => s.parentSpanId === root.spanId)!;
+    expect(dockerExecs).toHaveLength(2);
+    expect(callId(nested)).toBe("call_a");
+    expect(after.parentSpanId).toBe(root.spanId);
+    expect(callId(after)).toBe("stale");
+  });
+
   it("reports each agent's configured model and provider on its own session", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "tracing-models-"));
     const models = createAgentModels(path.join(dir, "agent-models.json"));

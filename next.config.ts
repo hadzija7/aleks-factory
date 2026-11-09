@@ -4,7 +4,7 @@ const nextConfig: NextConfig = {
   /* config options here */
   cacheComponents: true,
   partialPrefetching: true,
-  serverExternalPackages: ["@mozaik-ai/core"],
+  serverExternalPackages: ["@mozaik-ai/core", "@cursor/sdk"],
   turbopack: {
     rules: {
       "*.css": {

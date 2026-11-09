@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { diag, DiagConsoleLogger, DiagLogLevel, ROOT_CONTEXT, SpanKind, SpanStatusCode, trace, type Attributes, type Span } from "@opentelemetry/api";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
@@ -65,6 +66,10 @@ function vcsAttributes(vcs: VcsInfo, remoteUrl: string | undefined): Attributes 
 
 const defined = (attributes: Attributes) => Object.fromEntries(Object.entries(attributes).filter(([, v]) => v !== undefined)) as Attributes;
 
+/** The span in flight (a chat turn or a tool call) for code running inside it, e.g. tools an endpoint runs within `infer()`. */
+type ActiveSpan = { run: AgentRun; span: Span; toolCallId?: string };
+const activeSpan = new AsyncLocalStorage<ActiveSpan>();
+
 export class AgentRun {
   readonly conversationId = randomUUID();
   private readonly provider?: TracerProvider;
@@ -127,11 +132,22 @@ export class AgentRun {
     }
   }
 
-  /** One model turn: a `chat` span with the model and token counts. */
+  /** The run whose chat turn or tool call is in flight, for code inside an endpoint that has no other handle on the session. */
+  static current() {
+    return activeSpan.getStore()?.run;
+  }
+
+  /** The active chat or tool span if it belongs to this run, so spans started inside it nest under it. */
+  private active() {
+    const store = activeSpan.getStore();
+    return store?.run === this ? store : undefined;
+  }
+
+  /** One model turn: a `chat` span with the model and token counts. Tools run inside it (e.g. by the Cursor endpoint) nest under it. */
   modelTurn<T extends { tokenUsage?: TokenUsage }>(fn: () => Promise<T>) {
     const model = this.options.model;
     const span = this.startSpan(`chat ${model ?? ""}`.trim(), SpanKind.CLIENT, { "gen_ai.operation.name": "chat", "gen_ai.request.model": model }, this.root);
-    return this.traced(span, fn, ({ tokenUsage }) => {
+    return this.traced(span, () => activeSpan.run({ run: this, span }, fn), ({ tokenUsage }) => {
       if (!tokenUsage) return;
       span.setAttributes({ "gen_ai.usage.input_tokens": tokenUsage.inputTokens, "gen_ai.usage.output_tokens": tokenUsage.outputTokens });
     });
@@ -142,17 +158,24 @@ export class AgentRun {
     this.pendingToolCallId = callId;
   }
 
-  /** One tool execution: an `execute_tool` span; `failure` returns an error description for results that count as failed. */
-  executeTool<T>(name: string, fn: () => Promise<T>, failure: (result: T) => string | undefined) {
-    const callId = this.pendingToolCallId ?? randomUUID();
-    this.pendingToolCallId = undefined;
+  /**
+   * One tool execution: an `execute_tool` span; `failure` returns an error description for results that count as failed.
+   * Pass `callId` when calls can run concurrently; a span nested in another tool span inherits that span's call id.
+   */
+  executeTool<T>(name: string, fn: () => Promise<T>, failure: (result: T) => string | undefined, callId?: string) {
+    const parent = this.active();
+    let id = callId ?? parent?.toolCallId;
+    if (!id) {
+      id = this.pendingToolCallId ?? randomUUID();
+      this.pendingToolCallId = undefined;
+    }
     const span = this.startSpan(`execute_tool ${name}`, SpanKind.INTERNAL, {
       "gen_ai.operation.name": "execute_tool",
       "gen_ai.tool.name": name,
       "gen_ai.tool.type": "function",
-      "gen_ai.tool.call.id": callId,
-    }, this.root);
-    return this.traced(span, fn, (result) => {
+      "gen_ai.tool.call.id": id,
+    }, parent?.span ?? this.root);
+    return this.traced(span, () => activeSpan.run({ run: this, span, toolCallId: id }, fn), (result) => {
       const error = failure(result);
       if (error) fail(span, new Error(error));
     });
