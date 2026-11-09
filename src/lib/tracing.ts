@@ -4,6 +4,7 @@ import { diag, DiagConsoleLogger, DiagLogLevel, ROOT_CONTEXT, SpanKind, SpanStat
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { BatchSpanProcessor, TracerProvider } from "@opentelemetry/sdk-trace";
+import type { Tool } from "@mozaik-ai/core";
 import { version } from "../../package.json";
 import { execFileAsync } from "./docker";
 import type { AgentName } from "./factory-agents";
@@ -66,9 +67,12 @@ function vcsAttributes(vcs: VcsInfo, remoteUrl: string | undefined): Attributes 
 
 const defined = (attributes: Attributes) => Object.fromEntries(Object.entries(attributes).filter(([, v]) => v !== undefined)) as Attributes;
 
-/** The span in flight (a chat turn or a tool call) for code running inside it, e.g. tools an endpoint runs within `infer()`. */
-type ActiveSpan = { run: AgentRun; span: Span; toolCallId?: string };
-const activeSpan = new AsyncLocalStorage<ActiveSpan>();
+/** The tool span in flight, so spans started inside it (run_command's docker_exec) nest under it and share its call id. */
+const activeTool = new AsyncLocalStorage<{ run: AgentRun; span: Span; callId: string }>();
+/** The chat span in flight, so tools an endpoint runs inside its model turn (Cursor) nest under it. */
+const activeChat = new AsyncLocalStorage<{ run: AgentRun; span: Span }>();
+/** The call id an endpoint that runs the tool loop itself (Cursor) gave the tool call in flight. */
+const endpointCallId = new AsyncLocalStorage<string>();
 
 export class AgentRun {
   readonly conversationId = randomUUID();
@@ -132,53 +136,60 @@ export class AgentRun {
     }
   }
 
-  /** The run whose chat turn or tool call is in flight, for code inside an endpoint that has no other handle on the session. */
-  static current() {
-    return activeSpan.getStore()?.run;
+  /** Runs `fn` (which invokes one traced tool) with the call id the endpoint assigned, for calls that may run concurrently. */
+  static withToolCallId<T>(callId: string | undefined, fn: () => T) {
+    return callId ? endpointCallId.run(callId, fn) : fn();
   }
 
-  /** The active chat or tool span if it belongs to this run, so spans started inside it nest under it. */
-  private active() {
-    const store = activeSpan.getStore();
-    return store?.run === this ? store : undefined;
-  }
-
-  /** One model turn: a `chat` span with the model and token counts. Tools run inside it (e.g. by the Cursor endpoint) nest under it. */
+  /** One model turn: a `chat` span with the model and token counts. Tools run inside it (Cursor) nest under it. */
   modelTurn<T extends { tokenUsage?: TokenUsage }>(fn: () => Promise<T>) {
     const model = this.options.model;
     const span = this.startSpan(`chat ${model ?? ""}`.trim(), SpanKind.CLIENT, { "gen_ai.operation.name": "chat", "gen_ai.request.model": model }, this.root);
-    return this.traced(span, () => activeSpan.run({ run: this, span }, fn), ({ tokenUsage }) => {
+    return this.traced(span, () => activeChat.run({ run: this, span }, fn), ({ tokenUsage }) => {
       if (!tokenUsage) return;
       span.setAttributes({ "gen_ai.usage.input_tokens": tokenUsage.inputTokens, "gen_ai.usage.output_tokens": tokenUsage.outputTokens });
     });
   }
 
-  /** Records the id of the tool call the model just made, so the next tool span carries it. */
+  /** Records the id of the tool call Mozaik's loop is about to run (it runs one at a time), so the next tool span carries it. */
   setToolCallId(callId: string) {
     this.pendingToolCallId = callId;
   }
 
   /**
-   * One tool execution: an `execute_tool` span; `failure` returns an error description for results that count as failed.
-   * Pass `callId` when calls can run concurrently; a span nested in another tool span inherits that span's call id.
+   * One tool execution: an `execute_tool` span under the tool span it runs in (sharing its call id), else under the open
+   * chat span (an endpoint like Cursor running its tool loop inside the model turn), else under the session root, next to
+   * the chat spans (Mozaik's loop runs tools between turns). Otherwise the call id is the endpoint's (`withToolCallId`),
+   * else the one from `setToolCallId`. `failure` returns an error description for results that count as failed.
    */
-  executeTool<T>(name: string, fn: () => Promise<T>, failure: (result: T) => string | undefined, callId?: string) {
-    const parent = this.active();
-    let id = callId ?? parent?.toolCallId;
+  executeTool<T>(name: string, fn: () => Promise<T>, failure: (result: T) => string | undefined) {
+    const store = activeTool.getStore();
+    const parent = store?.run === this ? store : undefined;
+    const chat = activeChat.getStore();
+    let id = parent?.callId ?? endpointCallId.getStore();
     if (!id) {
       id = this.pendingToolCallId ?? randomUUID();
       this.pendingToolCallId = undefined;
     }
+    const callId = id;
     const span = this.startSpan(`execute_tool ${name}`, SpanKind.INTERNAL, {
       "gen_ai.operation.name": "execute_tool",
       "gen_ai.tool.name": name,
       "gen_ai.tool.type": "function",
-      "gen_ai.tool.call.id": id,
-    }, parent?.span ?? this.root);
-    return this.traced(span, () => activeSpan.run({ run: this, span, toolCallId: id }, fn), (result) => {
+      "gen_ai.tool.call.id": callId,
+    }, parent?.span ?? (chat?.run === this ? chat.span : this.root));
+    return this.traced(span, () => activeTool.run({ run: this, span, callId }, fn), (result) => {
       const error = failure(result);
       if (error) fail(span, new Error(error));
     });
+  }
+
+  /**
+   * The tracing layer at the tool boundary: the same tool with each invocation an `execute_tool` span, whichever path
+   * (Mozaik's function-call loop or an endpoint like Cursor) invokes it. Thrown errors mark the span failed.
+   */
+  traceTool(tool: Tool): Tool {
+    return { ...tool, invoke: (args) => this.executeTool(tool.name, () => tool.invoke(args), () => undefined) };
   }
 
   /** Adds attributes learned during the run (e.g. the merge commit) to the session's root span. */

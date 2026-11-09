@@ -76,7 +76,10 @@ function compileSchema(format: StructuredOutputFormat) {
   return (value: unknown) => (validate(value) ? undefined : ajv.errorsText(validate.errors, { dataVar: "result" }));
 }
 
-/** Wraps Mozaik tools as Cursor custom tools that call `tool.invoke`, traced as `execute_tool` spans on the active run. */
+/**
+ * Wraps Mozaik tools as Cursor custom tools that call `tool.invoke`, the same (already traced) tools Mozaik's own loop
+ * would call. Cursor may run calls in parallel, so each carries Cursor's call id to the tool's span.
+ */
 export function toCustomTools(tools: Tool[] | undefined, structuredOutput: StructuredOutputFormat | undefined) {
   const customTools: Record<string, SDKCustomTool> = {};
   const check = structuredOutput && compileSchema(structuredOutput);
@@ -87,13 +90,9 @@ export function toCustomTools(tools: Tool[] | undefined, structuredOutput: Struc
       description: tool.description,
       inputSchema: tool.parameters as Record<string, SDKJsonValue>,
       async execute(args, { toolCallId }) {
-        const invoke = async () => {
-          const out = await tool.invoke(args);
-          return capped(typeof out === "string" ? out : JSON.stringify(out));
-        };
-        const run = AgentRun.current();
         try {
-          return await (run ? run.executeTool(tool.name, invoke, () => undefined, toolCallId) : invoke());
+          const out = await AgentRun.withToolCallId(toolCallId, () => tool.invoke(args));
+          return capped(typeof out === "string" ? out : JSON.stringify(out));
         } catch (error) {
           // Same text as Mozaik's DefaultFunctionCallRunner, so the model can recover from tool errors the same way.
           return errorResult(`Error calling tool: ${error}`);

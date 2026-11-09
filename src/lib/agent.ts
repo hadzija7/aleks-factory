@@ -184,7 +184,7 @@ const AGENT_NAMES: Record<Role, ModelAgentName> = { execute: "implement", review
 
 /**
  * One traced session per agent run, on the agent's configured model (or MOZAIK_MODEL); run_command's sandbox calls become
- * `docker_exec` tool spans.
+ * `docker_exec` spans nested under its `execute_tool run_command` span.
  */
 async function startRun(task: Task, role: Role, sandbox: DockerSandbox) {
   const model = await agentModels.resolve(AGENT_NAMES[role]);
@@ -199,10 +199,14 @@ async function startRun(task: Task, role: Role, sandbox: DockerSandbox) {
 
 type Started = Awaited<ReturnType<typeof startRun>>;
 
+/**
+ * Tools are traced here, once, so every call is an `execute_tool` span whether Mozaik's loop or the endpoint (Cursor)
+ * invokes them.
+ */
 function startLoop(agent: Agent, taskId: string, role: Role, { run, model }: Started, message: string, input: Omit<InferenceInput, "model" | "context">) {
   const context = ModelContext.create().addContextItem(DeveloperMessageItem.create(agent.getDeveloperMessage()));
   resolveRuntime().state.sessionByContext.set(context.id, { taskId, role, contextId: context.id, run, model });
-  runLoop(agent.getId(), message, { model: model.model, context, ...input });
+  runLoop(agent.getId(), message, { model: model.model, context, ...input, tools: input.tools?.map((tool) => run.traceTool(tool)) });
 }
 
 type Rework = NonNullable<Task["rework"]>;
@@ -519,7 +523,7 @@ const trackActivity: SituationHandler = {
         if (narration && items.some((item) => item.type === "function_call")) addActivity(taskId, { kind: "message", role, title: narration });
       } else if (event.type === "function_call.started") {
         const { call } = event.payload as FunctionCallStartedPayload;
-        // Published synchronously right before the tool runs, so its docker_exec span gets this call id.
+        // Published synchronously right before the tool runs, so its execute_tool span gets this call id.
         session.run.setToolCallId(call.callId);
         const { title, detail } = describeToolCall(call.name, call.args);
         state.toolByCall.set(call.callId, { id: addActivity(taskId, { kind: "tool", role, tool: call.name, title, detail, status: "running" }), name: call.name });

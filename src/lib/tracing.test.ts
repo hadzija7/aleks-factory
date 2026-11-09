@@ -1,42 +1,18 @@
 import { mkdtemp, rm } from "node:fs/promises";
-import { createServer, type IncomingHttpHeaders } from "node:http";
-import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import type { Tool } from "@mozaik-ai/core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createAgentModels } from "./agent-models";
+import { attrs, otlpCollector, spanTree, type OtlpSpan } from "./otlp-collector.test-helper";
 import { AgentRun, parseRemote } from "./tracing";
 
-type OtlpValue = { stringValue?: string; intValue?: string | number; boolValue?: boolean };
-type OtlpAttribute = { key: string; value: OtlpValue };
-type OtlpSpan = { name: string; parentSpanId?: string; spanId: string; attributes: OtlpAttribute[]; status?: { code?: number } };
+const collector = otlpCollector();
+const { requests } = collector;
+beforeAll(() => collector.start());
+afterAll(() => collector.stop());
 
-const requests: { url?: string; headers: IncomingHttpHeaders; body: string }[] = [];
-const server = createServer((req, res) => {
-  let body = "";
-  req.on("data", (chunk) => (body += chunk));
-  req.on("end", () => {
-    requests.push({ url: req.url, headers: req.headers, body });
-    res.writeHead(200, { "content-type": "application/json" }).end("{}");
-  });
-});
-
-beforeAll(async () => {
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  process.env.DASH0_OTLP_ENDPOINT = `http://127.0.0.1:${(server.address() as AddressInfo).port}/`;
-  process.env.DASH0_AUTH_TOKEN = "test-token";
-  process.env.DASH0_DATASET = "test-dataset";
-});
-
-afterAll(() => {
-  delete process.env.DASH0_OTLP_ENDPOINT;
-  delete process.env.DASH0_AUTH_TOKEN;
-  delete process.env.DASH0_DATASET;
-  server.close();
-});
-
-const attrs = (list: OtlpAttribute[]) =>
-  Object.fromEntries(list.map(({ key, value }) => [key, value.stringValue ?? (value.intValue !== undefined ? Number(value.intValue) : value.boolValue)]));
+const tool = (name: string, invoke: Tool["invoke"]): Tool => ({ type: "function", name, description: name, parameters: {}, strict: true, invoke });
 
 describe("parseRemote", () => {
   it("parses ssh and https GitHub remotes", () => {
@@ -101,41 +77,40 @@ describe("AgentRun", () => {
     expect(byOp.execute_tool.status?.code).toBe(2);
   });
 
-  it("nests tools run inside a model turn under its chat span, with per-call ids even when calls run in parallel", async () => {
+  it("traces wrapped tools under the open chat span or else the root, with the call id from the endpoint or setToolCallId", async () => {
     requests.length = 0;
     const run = await AgentRun.start({ agentName: "review", model: "composer-2.5", provider: "cursor", vcs: { branch: "task/abcd1234" } });
-    run.setToolCallId("stale");
+    const runCommand = run.traceTool(tool("run_command", () => run.executeTool("docker_exec", async () => "TOOL OUTPUT", () => undefined)));
+    const readFile = run.traceTool(tool("read_file", async () => "FILE CONTENTS"));
+    const failing = run.traceTool(tool("edit_file", async () => Promise.reject(new Error("old text not found"))));
+
+    // Mozaik's loop: one call at a time, the id announced right before it runs.
+    run.setToolCallId("call_1");
+    await readFile.invoke({ path: "a.ts" });
+    run.setToolCallId("call_2");
+    await expect(failing.invoke({})).rejects.toThrow("old text not found");
+    // An endpoint running the loop inside a model turn (Cursor): parallel calls, each with its own id.
     await run.modelTurn(async () => {
-      expect(AgentRun.current()).toBe(run);
       await Promise.all([
-        run.executeTool("run_command", () => run.executeTool("docker_exec", async () => "TOOL OUTPUT", () => undefined), () => undefined, "call_a"),
-        run.executeTool("read_file", async () => "FILE CONTENTS", () => undefined, "call_b"),
+        AgentRun.withToolCallId("call_a", () => runCommand.invoke({ command: "ls" })),
+        AgentRun.withToolCallId("call_b", () => readFile.invoke({ path: "b.ts" })),
       ]);
       return { tokenUsage: { inputTokens: 5, outputTokens: 2 } };
     });
-    expect(AgentRun.current()).toBeUndefined();
-    await run.executeTool("docker_exec", async () => "", () => undefined);
     await run.end();
 
     const body = requests.map((r) => r.body).join("");
     expect(body).not.toContain("TOOL OUTPUT");
     expect(body).not.toContain("FILE CONTENTS");
-    const spans: OtlpSpan[] = JSON.parse(body).resourceSpans[0].scopeSpans[0].spans;
-    const span = (name: string, index = 0) => spans.filter((s) => s.name === name)[index];
-    const callId = (s: OtlpSpan) => attrs(s.attributes)["gen_ai.tool.call.id"];
-    const chat = span("chat composer-2.5");
-    const root = span("invoke_agent review");
-    expect(span("execute_tool run_command").parentSpanId).toBe(chat.spanId);
-    expect(span("execute_tool read_file").parentSpanId).toBe(chat.spanId);
-    expect(callId(span("execute_tool run_command"))).toBe("call_a");
-    expect(callId(span("execute_tool read_file"))).toBe("call_b");
-    const dockerExecs = spans.filter((s) => s.name === "execute_tool docker_exec");
-    const nested = dockerExecs.find((s) => s.parentSpanId === span("execute_tool run_command").spanId)!;
-    const after = dockerExecs.find((s) => s.parentSpanId === root.spanId)!;
-    expect(dockerExecs).toHaveLength(2);
-    expect(callId(nested)).toBe("call_a");
-    expect(after.parentSpanId).toBe(root.spanId);
-    expect(callId(after)).toBe("stale");
+    expect(body).not.toContain("a.ts");
+    expect(spanTree(collector.sessionSpans())).toEqual([
+      "chat composer-2.5",
+      "  execute_tool read_file (call_b)",
+      "  execute_tool run_command (call_a)",
+      "    execute_tool docker_exec (call_a)",
+      "execute_tool edit_file (call_2) [error]",
+      "execute_tool read_file (call_1)",
+    ]);
   });
 
   it("reports each agent's configured model and provider on its own session", async () => {
