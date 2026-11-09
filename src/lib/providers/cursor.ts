@@ -1,7 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { Agent, emptyFs, type AgentOptions, type RunResult, type SDKCustomTool, type SDKCustomToolResult, type SDKJsonValue } from "@cursor/sdk";
+import { Agent, emptyFs, type AgentOptions, type ModelSelection, type RunResult, type SDKCustomTool, type SDKCustomToolResult, type SDKJsonValue } from "@cursor/sdk";
 import {
   DeveloperMessageItem,
   FunctionCallItem,
@@ -19,16 +19,16 @@ import {
   type Tool,
 } from "@mozaik-ai/core";
 import Ajv from "ajv";
+import type { GenerativeModel } from "../models";
 import { AgentRun } from "../tracing";
 
 /**
- * Composer through the Cursor SDK (`@cursor/sdk`) as a Mozaik model. The SDK is an agent SDK, not a chat-completions API:
+ * A Cursor model (any id from `Cursor.models.list()`, see cursor-models.ts) through the Cursor SDK (`@cursor/sdk`) as a Mozaik model. The SDK is an agent SDK, not a chat-completions API:
  * one `infer()` is one `Agent.prompt()` run in which Cursor drives the whole tool loop. Mozaik's tools are handed to it as
  * `local.customTools`, so Mozaik's own function_call loop (and its `function_call.*` events) never runs for this model and
  * `infer()` returns only the final ModelMessageItem. The SDK owns the endpoint and auth; `Agent.prompt` has no base URL option.
  */
 
-export const COMPOSER_MODEL = "composer-2.5";
 export const CURSOR_CREDENTIAL_ENV = "CURSOR_API_KEY";
 export const SUBMIT_RESULT_TOOL = "submit_result";
 // The SDK spills MCP results over 40 KB to a /tmp file the model must `Read`, which these runs don't offer.
@@ -152,18 +152,18 @@ export class CursorEndpoint implements Endpoint {
   readonly endpointMapper = { toRequest: unusedMapper, toResponse: unusedMapper };
 
   constructor(
-    private readonly modelId: string = COMPOSER_MODEL,
+    private readonly selection: ModelSelection,
     private readonly prompt: Prompt = (message, options) => Agent.prompt(message, options),
   ) {}
 
   async infer(input: InferenceInput): Promise<InferenceOutput> {
     const apiKey = process.env[CURSOR_CREDENTIAL_ENV]?.trim();
-    if (!apiKey) throw new Error(`${CURSOR_CREDENTIAL_ENV} is not set; add a Cursor API key to use ${this.modelId}`);
+    if (!apiKey) throw new Error(`${CURSOR_CREDENTIAL_ENV} is not set; add a Cursor API key to use ${this.selection.id}`);
     const { customTools, submitted, check } = toCustomTools(input.tools, input.structuredOutput);
 
     const result = await this.prompt(flattenContext(input), {
       apiKey,
-      model: { id: this.modelId },
+      model: this.selection,
       // Only the MCP family, which is how custom tools are called: `tools: []` would also remove them. No built-in shell,
       // edit or read tools, so all work goes through the factory's sandboxed tools.
       tools: ["mcp"],
@@ -179,7 +179,7 @@ export class CursorEndpoint implements Endpoint {
       if (answer === undefined) {
         // Fallback for a model that wrote the JSON answer as text instead of calling submit_result.
         const parsed = parseJson(result.result);
-        if (parsed === undefined || check(parsed)) throw new Error(`${this.modelId} finished without calling ${SUBMIT_RESULT_TOOL} with a valid result`);
+        if (parsed === undefined || check(parsed)) throw new Error(`${this.selection.id} finished without calling ${SUBMIT_RESULT_TOOL} with a valid result`);
         answer = parsed;
       }
       text = JSON.stringify(answer);
@@ -192,21 +192,24 @@ export class CursorEndpoint implements Endpoint {
   }
 }
 
-export const composerModel = {
-  endpoint: new CursorEndpoint(),
-  specification: {
-    name: COMPOSER_MODEL,
-    provider: "cursor",
-    supportsReasoningEffort: false,
-    supportedReasoningEfforts: [],
-    supportsStreaming: false,
-    // Not published by Cursor, and Cursor manages the run's context itself; 0 means unknown.
-    contextWindowSize: 0,
-    maxOutputTokens: 0,
-    // Cursor runs the tools inside infer(); true lets Mozaik hand tools to this endpoint.
-    supportsFunctionCalling: true,
-    // Emulated with the submit_result custom tool; the SDK has no response_format.
-    supportsStructuredOutput: true,
-    supportedContextItemTypes: ["user_message", "system_message", "developer_message", "model_message"],
-  },
-};
+/** A Cursor model as a Mozaik model; `selection.params` (e.g. a catalog variant's) are sent explicitly on every run. */
+export function cursorModel(selection: ModelSelection, prompt?: Prompt): GenerativeModel {
+  return {
+    endpoint: new CursorEndpoint(selection, prompt),
+    specification: {
+      name: selection.id,
+      provider: "cursor",
+      supportsReasoningEffort: false,
+      supportedReasoningEfforts: [],
+      supportsStreaming: false,
+      // The catalog doesn't report limits, and Cursor manages the run's context itself; 0 means unknown.
+      contextWindowSize: 0,
+      maxOutputTokens: 0,
+      // Every Cursor model runs through this endpoint: Cursor calls the tools inside infer() (true lets Mozaik hand them
+      // over), and structured output is emulated with the submit_result custom tool since the SDK has no response_format.
+      supportsFunctionCalling: true,
+      supportsStructuredOutput: true,
+      supportedContextItemTypes: ["user_message", "system_message", "developer_message", "model_message"],
+    },
+  };
+}

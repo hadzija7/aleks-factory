@@ -2,7 +2,7 @@ import type { AgentOptions, RunResult, SDKCustomTool, SDKCustomToolResult } from
 import { DeveloperMessageItem, ModelContext, ModelMessageItem, UserMessageItem, type InferenceInput, type Tool } from "@mozaik-ai/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentRun } from "../tracing";
-import { composerModel, CursorEndpoint, flattenContext, SUBMIT_RESULT_TOOL } from "./cursor";
+import { CursorEndpoint, cursorModel, flattenContext, SUBMIT_RESULT_TOOL } from "./cursor";
 
 // Nothing reaches the network: every test injects `prompt` or uses this mock.
 const sdk = vi.hoisted(() => ({ prompt: vi.fn(), emptyFs: vi.fn(() => ({ kind: "empty-fs" })) }));
@@ -18,6 +18,7 @@ afterEach(() => {
   else process.env.CURSOR_API_KEY = key;
 });
 
+const COMPOSER = { id: "composer-2.5" };
 const usage = { inputTokens: 100, outputTokens: 20, cacheReadTokens: 30, cacheWriteTokens: 5, totalTokens: 120, reasoningTokens: 7 };
 const finished = (result: string): RunResult => ({ id: "run-1", status: "finished", result, usage });
 
@@ -72,7 +73,7 @@ describe("CursorEndpoint", () => {
   it("runs one Agent.prompt with only custom tools and maps the answer and token usage", async () => {
     const read = readFile();
     const prompt = fakePrompt([[["read_file", { path: "package.json" }, "call_1"]]]);
-    const output = await new CursorEndpoint("composer-2.5", prompt).infer(inputWith({ tools: [read] }));
+    const output = await new CursorEndpoint(COMPOSER, prompt).infer(inputWith({ tools: [read] }));
 
     expect(prompt).toHaveBeenCalledTimes(1);
     const [message, options] = prompt.mock.calls[0];
@@ -106,7 +107,7 @@ describe("CursorEndpoint", () => {
     const failing = tool("run_command", async () => Promise.reject(new Error("container is gone")));
     const big = tool("list_files", async () => "x".repeat(50_000));
     const prompt = fakePrompt([[["run_command", { path: "." }], ["list_files", { path: "." }]]]);
-    const output = await new CursorEndpoint("composer-2.5", prompt).infer(inputWith({ tools: [failing, big] }));
+    const output = await new CursorEndpoint(COMPOSER, prompt).infer(inputWith({ tools: [failing, big] }));
     const [error, listing] = outputsOf(output);
     expect(error).toEqual({ content: [{ type: "text", text: "Error calling tool: Error: container is gone" }], isError: true });
     expect((listing as string).length).toBeLessThan(31_000);
@@ -116,7 +117,7 @@ describe("CursorEndpoint", () => {
   it("emulates structured output with submit_result and returns its args as the answer JSON", async () => {
     const review = { verdict: "approve", summary: "Looks good", findings: [] };
     const prompt = fakePrompt([[[SUBMIT_RESULT_TOOL, review]]], "OK, submitted.");
-    const output = await new CursorEndpoint("composer-2.5", prompt).infer(
+    const output = await new CursorEndpoint(COMPOSER, prompt).infer(
       inputWith({ tools: [readFile()], structuredOutput: { name: "code_review", schema: REVIEW_SCHEMA } }),
     );
 
@@ -130,7 +131,7 @@ describe("CursorEndpoint", () => {
     const bad = { verdict: "lgtm", summary: "Looks good" };
     const good = { verdict: "request_changes", summary: "Missing test", findings: ["add a test"] };
     const prompt = fakePrompt([[[SUBMIT_RESULT_TOOL, bad]], [[SUBMIT_RESULT_TOOL, good]]]);
-    const output = await new CursorEndpoint("composer-2.5", prompt).infer(inputWith({ structuredOutput: { schema: REVIEW_SCHEMA } }));
+    const output = await new CursorEndpoint(COMPOSER, prompt).infer(inputWith({ structuredOutput: { schema: REVIEW_SCHEMA } }));
 
     const [rejected, accepted] = outputsOf(output);
     expect(rejected).toMatchObject({ isError: true });
@@ -141,27 +142,32 @@ describe("CursorEndpoint", () => {
 
   it("accepts a valid JSON answer written as text, and fails a structured turn without a valid result", async () => {
     const review = { verdict: "approve", summary: "ok", findings: [] };
-    const asText = await new CursorEndpoint("composer-2.5", fakePrompt([], JSON.stringify(review))).infer(inputWith({ structuredOutput: { schema: REVIEW_SCHEMA } }));
+    const asText = await new CursorEndpoint(COMPOSER, fakePrompt([], JSON.stringify(review))).infer(inputWith({ structuredOutput: { schema: REVIEW_SCHEMA } }));
     expect(JSON.parse(answerText(asText))).toEqual(review);
 
     const structured = inputWith({ structuredOutput: { schema: REVIEW_SCHEMA } });
-    await expect(new CursorEndpoint("composer-2.5", fakePrompt([], "I approve.")).infer(structured)).rejects.toThrow(/without calling submit_result/);
+    await expect(new CursorEndpoint(COMPOSER, fakePrompt([], "I approve.")).infer(structured)).rejects.toThrow(/without calling submit_result/);
     const invalid = fakePrompt([[[SUBMIT_RESULT_TOOL, { verdict: "maybe" }]]], '{"verdict":"maybe"}');
-    await expect(new CursorEndpoint("composer-2.5", invalid).infer(structured)).rejects.toThrow(/without calling submit_result with a valid result/);
+    await expect(new CursorEndpoint(COMPOSER, invalid).infer(structured)).rejects.toThrow(/without calling submit_result with a valid result/);
   });
 
   it("surfaces failed runs and a missing CURSOR_API_KEY as errors", async () => {
     const errored = vi.fn(async () => ({ id: "r", status: "error", error: { message: "Bad model name" } }) as RunResult);
-    await expect(new CursorEndpoint("composer-2.5", errored).infer(inputWith())).rejects.toThrow("Cursor run error: Bad model name");
+    await expect(new CursorEndpoint(COMPOSER, errored).infer(inputWith())).rejects.toThrow("Cursor run error: Bad model name");
     delete process.env.CURSOR_API_KEY;
-    await expect(new CursorEndpoint("composer-2.5", errored).infer(inputWith())).rejects.toThrow("CURSOR_API_KEY is not set");
+    await expect(new CursorEndpoint(COMPOSER, errored).infer(inputWith())).rejects.toThrow("CURSOR_API_KEY is not set");
     expect(errored).toHaveBeenCalledTimes(1);
   });
 
-  it("calls the SDK's Agent.prompt by default (mocked here)", async () => {
+  it("calls the SDK's Agent.prompt by default (mocked here), sending the model's explicit params", async () => {
     sdk.prompt.mockResolvedValue(finished("hi"));
-    const output = await composerModel.endpoint.infer(inputWith());
-    expect(sdk.prompt).toHaveBeenCalledWith(expect.stringContaining("Add a README."), expect.objectContaining({ model: { id: "composer-2.5" }, tools: ["mcp"] }));
+    const grok = cursorModel({ id: "grok-4.7", params: [{ id: "effort", value: "high" }] });
+    expect(grok.specification).toMatchObject({ name: "grok-4.7", provider: "cursor", supportsFunctionCalling: true, supportsStructuredOutput: true });
+    const output = await grok.endpoint.infer(inputWith());
+    expect(sdk.prompt).toHaveBeenCalledWith(
+      expect.stringContaining("Add a README."),
+      expect.objectContaining({ model: { id: "grok-4.7", params: [{ id: "effort", value: "high" }] }, tools: ["mcp"] }),
+    );
     expect(answerText(output)).toBe("hi");
   });
 
@@ -169,7 +175,7 @@ describe("CursorEndpoint", () => {
     const run = await AgentRun.start({ agentName: "implement", model: "composer-2.5", provider: "cursor", vcs: { branch: "task/x" } });
     const executeTool = vi.spyOn(run, "executeTool");
     const prompt = fakePrompt([[["read_file", { path: "a.ts" }, "call_a"], ["read_file", { path: "b.ts" }, "call_b"]]]);
-    await run.modelTurn(() => new CursorEndpoint("composer-2.5", prompt).infer(inputWith({ tools: [readFile()] })));
+    await run.modelTurn(() => new CursorEndpoint(COMPOSER, prompt).infer(inputWith({ tools: [readFile()] })));
     expect(executeTool.mock.calls.map(([name, , , callId]) => [name, callId])).toEqual([["read_file", "call_a"], ["read_file", "call_b"]]);
     expect(AgentRun.current()).toBeUndefined();
     await run.end();

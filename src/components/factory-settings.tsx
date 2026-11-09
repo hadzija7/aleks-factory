@@ -73,7 +73,9 @@ export function FactorySettings() {
         const choice = draft[agent.id] ?? null;
         const view = settings.agents.find((a) => a.agent === agent.id);
         const provider = choice ? providers.find((p) => p.id === choice.provider) : undefined;
-        const firstUsable = (p: ProviderInfo) => p.models.find((m) => agent.requires.every((c) => m.capabilities.includes(c)));
+        const usable = (m: ProviderInfo["models"][number]) => agent.requires.every((c) => m.capabilities.includes(c));
+        const firstUsable = (p: ProviderInfo) => p.models.find(usable);
+        const initialModel = (p: ProviderInfo) => p.models.find((m) => m.name === p.defaultModel && usable(m)) ?? firstUsable(p);
         return (
           <section key={agent.id} className="flex flex-col gap-3 rounded-xl border border-black/10 p-5 dark:border-white/15">
             <div>
@@ -88,7 +90,7 @@ export function FactorySettings() {
                   value={choice?.provider ?? ""}
                   onChange={(e) => {
                     const next = providers.find((p) => p.id === e.target.value);
-                    const model = next && firstUsable(next);
+                    const model = next && initialModel(next);
                     update(agent.id, next && model ? { provider: next.id, model: model.name } : null);
                   }}
                   className={selectClass}
@@ -117,7 +119,9 @@ export function FactorySettings() {
                     const missing = agent.requires.filter((c) => !m.capabilities.includes(c));
                     return (
                       <option key={m.name} value={m.name} disabled={missing.length > 0}>
-                        {m.name}
+                        {m.label ? `${m.label} (${m.name})` : m.name}
+                        {m.name === provider?.defaultModel && " · default"}
+                        {m.unverified && " · not verified"}
                         {missing.length
                           ? ` (no ${missing.map((c) => CAPABILITY_LABELS[c]).join(", ")})`
                           : m.contextWindowSize

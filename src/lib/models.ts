@@ -1,6 +1,6 @@
 import { supportedModels } from "@mozaik-ai/core";
 import type { ModelCapability, ModelInfo, ProviderInfo } from "./factory-agents";
-import { composerModel, CURSOR_CREDENTIAL_ENV } from "./providers/cursor";
+import { cursorProvider } from "./providers/cursor-models";
 
 /** Mozaik's `{ endpoint, specification }` model type, which its package doesn't export by name. */
 export type GenerativeModel = (typeof supportedModels)[number];
@@ -15,9 +15,18 @@ export type ModelProvider = {
   credentialEnv: string;
   note?: string;
   models: GenerativeModel[];
+  /** The model the settings UI picks when this provider is selected. */
+  defaultModel?: string;
+  /** Display names by model name. */
+  modelLabels?: Record<string, string>;
+  /** Models listed without the provider confirming them (e.g. its catalog couldn't be loaded). */
+  unverifiedModels?: string[];
 };
 
-type ProviderMeta = Omit<ModelProvider, "id" | "models">;
+/** A provider, or a function that lists it now, for providers whose models are discovered at runtime (cached by the provider). */
+export type ProviderSource = ModelProvider | (() => Promise<ModelProvider>);
+
+type ProviderMeta = Pick<ModelProvider, "label" | "credentialEnv" | "note">;
 
 const MOZAIK_PROVIDERS: Record<string, ProviderMeta> = {
   openai: { label: "OpenAI", credentialEnv: "OPENAI_API_KEY" },
@@ -30,18 +39,10 @@ const MOZAIK_PROVIDERS: Record<string, ProviderMeta> = {
   },
 };
 
-/** Providers whose endpoints live in the factory rather than in Mozaik. */
-export const FACTORY_PROVIDERS: ModelProvider[] = [
-  {
-    id: "cursor",
-    label: "Cursor",
-    credentialEnv: CURSOR_CREDENTIAL_ENV,
-    note: "Composer via the Cursor SDK. Cursor runs the tool loop itself, so tool calls show up in Dash0 traces but not in the task activity feed.",
-    models: [composerModel],
-  },
-];
+/** Providers whose endpoints live in the factory rather than in Mozaik. Cursor's models come from the account's catalog. */
+export const FACTORY_PROVIDERS: ProviderSource[] = [() => cursorProvider()];
 
-function mozaikProviders(): ModelProvider[] {
+export function mozaikProviders(): ModelProvider[] {
   const byId = new Map<string, ModelProvider>();
   for (const model of supportedModels) {
     const id = model.specification.provider;
@@ -58,7 +59,7 @@ export function capabilities(model: GenerativeModel): ModelCapability[] {
 }
 
 /** Merges providers by id; a later model with the same provider and name replaces the earlier one. */
-export function createModelRegistry(providers: ModelProvider[]) {
+function snapshot(providers: ModelProvider[]) {
   const merged = new Map<string, ModelProvider>();
   for (const provider of providers) {
     const existing = merged.get(provider.id);
@@ -79,18 +80,34 @@ export function createModelRegistry(providers: ModelProvider[]) {
     },
     /** What the settings UI shows; credentials are reported as set or not, never their values. */
     describe: (): ProviderInfo[] =>
-      list.map(({ id, label, credentialEnv, note, models }) => ({
+      list.map(({ id, label, credentialEnv, note, models, defaultModel, modelLabels, unverifiedModels }) => ({
         id,
         label,
         credentialEnv,
         credentialSet: Boolean(process.env[credentialEnv]?.trim()),
         ...(note && { note }),
-        models: models.map((m): ModelInfo => ({
-          name: m.specification.name,
-          ...(m.specification.contextWindowSize > 0 && { contextWindowSize: m.specification.contextWindowSize }),
-          capabilities: capabilities(m),
-        })),
+        ...(defaultModel && models.some((m) => m.specification.name === defaultModel) && { defaultModel }),
+        models: models.map((m): ModelInfo => {
+          const { name, contextWindowSize } = m.specification;
+          const label = modelLabels?.[name];
+          return {
+            name,
+            ...(label && label !== name && { label }),
+            ...(contextWindowSize > 0 && { contextWindowSize }),
+            capabilities: capabilities(m),
+            ...(unverifiedModels?.includes(name) && { unverified: true }),
+          };
+        }),
       })),
+  };
+}
+
+export type RegistrySnapshot = ReturnType<typeof snapshot>;
+
+/** The providers' models as of now; call `load()` for every lookup, since runtime-discovered models can change. */
+export function createModelRegistry(sources: ProviderSource[]) {
+  return {
+    load: async () => snapshot(await Promise.all(sources.map((source) => (typeof source === "function" ? source() : source)))),
   };
 }
 
