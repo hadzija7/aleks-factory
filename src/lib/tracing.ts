@@ -82,6 +82,9 @@ export class AgentRun {
   private readonly root: Span;
   private readonly attributes: Attributes;
   private pendingToolCallId?: string;
+  /** The latest chat span, and the one whose turn requested each announced call (tools run after it ended). */
+  private lastChat?: Span;
+  private readonly chatByCall = new Map<string, Span>();
   private ended = false;
 
   private constructor(private readonly options: AgentRunOptions, config: ReturnType<typeof exporterConfig>, extra: Attributes) {
@@ -143,31 +146,46 @@ export class AgentRun {
     return callId ? endpointCallId.run(callId, fn) : fn();
   }
 
-  /** One model turn: a `chat` span with the model and token counts. Tools run inside it (Cursor) nest under it. */
+  /** One model turn: a `chat` span with the model and token counts, the parent of the tool calls it makes. */
   modelTurn<T extends { tokenUsage?: TokenUsage }>(fn: () => Promise<T>) {
     const model = this.options.model;
     const span = this.startSpan(`chat ${model ?? ""}`.trim(), SpanKind.CLIENT, { "gen_ai.operation.name": "chat", "gen_ai.request.model": model }, this.root);
+    this.lastChat = span;
     return this.traced(span, () => activeChat.run({ run: this, span }, fn), ({ tokenUsage }) => {
       if (!tokenUsage) return;
       span.setAttributes({ "gen_ai.usage.input_tokens": tokenUsage.inputTokens, "gen_ai.usage.output_tokens": tokenUsage.outputTokens });
     });
   }
 
-  /** Records the id of the tool call Mozaik's loop is about to run (it runs one at a time), so the next tool span carries it. */
+  /**
+   * Records the id of the tool call Mozaik's loop is about to run (it runs one at a time), so the next tool span carries
+   * it, and the chat turn that requested it (the latest one), so the span nests under that turn.
+   */
   setToolCallId(callId: string) {
     this.pendingToolCallId = callId;
+    if (this.lastChat) this.chatByCall.set(callId, this.lastChat);
   }
 
   /**
-   * One tool execution: an `execute_tool` span under the tool span it runs in (sharing its call id), else under the open
-   * chat span (an endpoint like Cursor running its tool loop inside the model turn), else under the session root, next to
-   * the chat spans (Mozaik's loop runs tools between turns). Otherwise the call id is the endpoint's (`withToolCallId`),
-   * else the one from `setToolCallId`. `failure` returns an error description for results that count as failed.
+   * The parent of a tool span that isn't nested in another tool: the open chat span when an endpoint runs the tool loop
+   * inside its model turn (Cursor), else the turn that requested the call (Mozaik's loop runs it after that span ended,
+   * which OTel allows), else the latest turn. The root only when the session had no chat turn.
+   */
+  private chatFor(callId: string) {
+    const open = activeChat.getStore();
+    const requester = this.chatByCall.get(callId);
+    this.chatByCall.delete(callId);
+    return (open?.run === this ? open.span : undefined) ?? requester ?? this.lastChat ?? this.root;
+  }
+
+  /**
+   * One tool execution: an `execute_tool` span under the tool span it runs in (sharing its call id, like run_command's
+   * docker_exec), else under its chat turn (`chatFor`). Otherwise the call id is the endpoint's (`withToolCallId`), else
+   * the one from `setToolCallId`. `failure` returns an error description for results that count as failed.
    */
   executeTool<T>(name: string, fn: () => Promise<T>, failure: (result: T) => string | undefined) {
     const store = activeTool.getStore();
     const parent = store?.run === this ? store : undefined;
-    const chat = activeChat.getStore();
     let id = parent?.callId ?? endpointCallId.getStore();
     if (!id) {
       id = this.pendingToolCallId ?? randomUUID();
@@ -179,7 +197,7 @@ export class AgentRun {
       "gen_ai.tool.name": name,
       "gen_ai.tool.type": "function",
       "gen_ai.tool.call.id": callId,
-    }, parent?.span ?? (chat?.run === this ? chat.span : this.root));
+    }, parent?.span ?? this.chatFor(callId));
     return this.traced(span, () => activeTool.run({ run: this, span, callId }, fn), (result) => {
       const error = failure(result);
       if (error) fail(span, new Error(error));

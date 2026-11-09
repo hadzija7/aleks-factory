@@ -91,7 +91,8 @@ export function toCustomTools(tools: Tool[] | undefined, structuredOutput: Struc
       inputSchema: tool.parameters as Record<string, SDKJsonValue>,
       async execute(args, { toolCallId }) {
         try {
-          const out = await AgentRun.withToolCallId(toolCallId, () => tool.invoke(args));
+          // Cursor joins two ids with a newline ("call-…-N\nfc_…_M"); the first one identifies the call.
+          const out = await AgentRun.withToolCallId(toolCallId?.split("\n")[0], () => tool.invoke(args));
           return capped(typeof out === "string" ? out : JSON.stringify(out));
         } catch (error) {
           // Same text as Mozaik's DefaultFunctionCallRunner, so the model can recover from tool errors the same way.

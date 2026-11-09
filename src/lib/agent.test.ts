@@ -8,7 +8,7 @@ import { executeTask } from "./agent";
 import type { ResolvedModel } from "./agent-models";
 import type { CommandResult } from "./docker-sandbox";
 import type { GenerativeModel } from "./models";
-import { otlpCollector, spanTree } from "./otlp-collector.test-helper";
+import { otlpCollector, spanTree, toolSpanViolations } from "./otlp-collector.test-helper";
 import { cursorModel } from "./providers/cursor";
 import type { Task } from "./tasks";
 
@@ -87,7 +87,8 @@ function mozaikModel(): ResolvedModel {
 function cursorPathModel(): ResolvedModel {
   const prompt = vi.fn(async (_message: string, options: AgentOptions) => {
     const tools = options.local?.customTools as Record<string, SDKCustomTool>;
-    for (const { callId, name, args } of CALLS) await tools[name].execute(args as never, { toolCallId: callId });
+    // Cursor's toolCallId joins two ids with a newline.
+    for (const [i, { callId, name, args }] of CALLS.entries()) await tools[name].execute(args as never, { toolCallId: `${callId}\nfc_${i}` });
     return { id: "run-1", status: "finished", result: "Done." } as RunResult;
   });
   return { provider: "cursor", model: "composer-2.5", source: "settings", supported: true, generative: cursorModel({ id: "composer-2.5" }, prompt) };
@@ -98,27 +99,26 @@ async function traceOf(model: ResolvedModel) {
   executeTask(task);
   await vi.waitFor(() => expect(collector.requests).toHaveLength(1), { timeout: 5000 });
   const body = collector.requests[0].body;
-  for (const secret of ["FILE CONTENTS", "COMMAND OUTPUT", "npm test", "README.md"]) expect(body).not.toContain(secret);
-  return spanTree(collector.sessionSpans());
+  for (const secret of ["FILE CONTENTS", "COMMAND OUTPUT", "npm test", "README.md", "fc_"]) expect(body).not.toContain(secret);
+  const spans = collector.sessionSpans();
+  expect(toolSpanViolations(spans)).toEqual([]);
+  return spanTree(spans);
 }
 
-const TOOL_SPANS = [
-  "execute_tool read_file (call_missing) [error]",
-  "execute_tool read_file (call_read)",
-  "execute_tool run_command (call_run)",
-  "  execute_tool docker_exec (call_run) [error]",
-];
+const READ = "  execute_tool read_file (call_read)";
+const RUN = ["  execute_tool run_command (call_run)", "    execute_tool docker_exec (call_run) [error]"];
+const MISSING = "  execute_tool read_file (call_missing) [error]";
 
 describe("agent tool tracing", () => {
-  it("gives each tool call in Mozaik's loop one execute_tool span under the root, next to the per-turn chat spans", async () => {
+  it("nests each tool call in Mozaik's loop under the chat turn that requested it", async () => {
     const tree = await traceOf(mozaikModel());
-    expect(tree).toEqual([...Array(4).fill("chat gpt-5.5"), ...TOOL_SPANS, "workspace_setup"]);
+    expect(tree).toEqual(["chat gpt-5.5", READ, "chat gpt-5.5", ...RUN, "chat gpt-5.5", MISSING, "chat gpt-5.5", "workspace_setup"]);
     expect(fakes.exec).toHaveBeenCalledWith("npm test");
   });
 
-  it("produces the same tool spans when Cursor runs the tool loop, one per call, nested under its one chat span", async () => {
+  it("gives the same tool spans when Cursor runs the tool loop, under its one chat turn, with clean call ids", async () => {
     const tree = await traceOf(cursorPathModel());
-    expect(tree).toEqual(["chat composer-2.5", ...TOOL_SPANS.map((line) => `  ${line}`), "workspace_setup"]);
+    expect(tree).toEqual(["chat composer-2.5", MISSING, READ, ...RUN, "workspace_setup"]);
     expect(fakes.exec).toHaveBeenCalledWith("npm test");
   });
 });
