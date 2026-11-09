@@ -135,8 +135,8 @@ function modelFor(selection: ModelSelection) {
 export async function cursorProvider(catalog = cursorCatalog): Promise<ModelProvider> {
   const result = await catalog.get();
   const wanted = defaultCursorModel();
+  const known = [...new Set([wanted, COMPOSER_MODEL])];
   if (result.source === "fallback") {
-    const known = [...new Set([wanted, COMPOSER_MODEL])];
     return {
       ...PROVIDER,
       models: known.map((id) => modelFor({ id })),
@@ -150,6 +150,13 @@ export async function cursorProvider(catalog = cursorCatalog): Promise<ModelProv
     ...PROVIDER,
     models: result.models.map((m) => modelFor(selectionFor(m))),
     modelLabels: Object.fromEntries(result.models.map((m) => [m.id, m.displayName])),
+    // Settings saved from the unverified list keep working once the catalog loads.
+    modelAliases: Object.fromEntries(
+      known.flatMap((id) => {
+        const match = findCatalogModel(result.models, id);
+        return match ? [[id, match.id]] : [];
+      }),
+    ),
     defaultModel: found?.id,
     note: [
       ...(found ? [] : [`The default model ${wanted} isn't in this account's catalog.`]),
