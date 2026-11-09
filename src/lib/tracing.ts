@@ -5,14 +5,13 @@ import { resourceFromAttributes } from "@opentelemetry/resources";
 import { BatchSpanProcessor, TracerProvider } from "@opentelemetry/sdk-trace";
 import { version } from "../../package.json";
 import { execFileAsync } from "./docker";
+import type { AgentName } from "./factory-agents";
 
 /**
  * OpenTelemetry tracing of agent sessions for Dash0 AI SDLC Insights, enabled when DASH0_OTLP_ENDPOINT and DASH0_AUTH_TOKEN are set.
  * Each agent run is one session (`gen_ai.conversation.id`) with its own tracer provider, so the session attributes are both resource
  * and span attributes. Only metadata is exported: never prompts, messages, tool arguments or tool output.
  */
-
-export type AgentName = "implement" | "review" | "merge";
 
 export type VcsInfo = { branch: string; startingCommit?: string; remoteUrl?: string; pullRequestUrl?: string; issueUrl?: string };
 

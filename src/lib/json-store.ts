@@ -43,6 +43,13 @@ export function createJsonStore<T extends Entity>(file: string) {
         await writeAll(items);
         return items[index];
       }),
+    upsert: (item: T) =>
+      serialize(async () => {
+        const items = await readAll();
+        const index = items.findIndex((existing) => existing.id === item.id);
+        await writeAll(index === -1 ? [...items, item] : items.with(index, item));
+        return item;
+      }),
     remove: (id: string) =>
       serialize(async () => {
         const items = await readAll();
