@@ -36,7 +36,11 @@ export const isModelAgent = (value: unknown): value is ModelAgentName => MODEL_A
 
 export type ModelChoice = { provider: string; model: string };
 
-export type ModelInfo = { name: string; contextWindowSize: number; capabilities: ModelCapability[] };
+/**
+ * `label` is a display name when it differs from `name`; `contextWindowSize` is absent when the provider doesn't publish it;
+ * `unverified` marks a known model listed without the provider confirming it (its catalog couldn't be loaded).
+ */
+export type ModelInfo = { name: string; label?: string; contextWindowSize?: number; capabilities: ModelCapability[]; unverified?: boolean };
 
 export type ProviderInfo = {
   id: string;
@@ -45,6 +49,8 @@ export type ProviderInfo = {
   credentialEnv: string;
   credentialSet: boolean;
   note?: string;
+  /** The model picked when this provider is selected. */
+  defaultModel?: string;
   models: ModelInfo[];
 };
 

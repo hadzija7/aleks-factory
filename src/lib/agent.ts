@@ -121,7 +121,7 @@ const inferenceRunner: InferenceRunner = {
   async run(input) {
     const session = resolveRuntime().state.sessionByContext.get(input.context.id);
     try {
-      const model = session ? session.model.generative : modelRegistry.findByName(input.model)?.model;
+      const model = session ? session.model.generative : (await modelRegistry.load()).findByName(input.model)?.model;
       if (!model) {
         const name = session?.model.provider ? `${session.model.provider}/${input.model}` : input.model;
         throw new Error(`Unsupported model: ${name}. Pick a supported one in Factory settings or MOZAIK_MODEL.`);
